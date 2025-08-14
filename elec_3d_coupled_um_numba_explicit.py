@@ -370,7 +370,7 @@ class AMGPoissonSolver:
 
         # Solve the system
         # Note: The order='F' is crucial because indexing uses Fortran/column-major ordering
-        phi_flat = self.ml.solve(rhs, tol=1e-10, maxiter=10) # Reduced maxiter for speed
+        phi_flat = self.ml.solve(rhs, tol=1e-5, maxiter=1) # Reduced maxiter for speed
         return phi_flat.reshape(self.shape, order="F")
 
 def create_grid(dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
@@ -572,6 +572,6 @@ if __name__ == "__main__":
     print("NOW RUNNING THE NUMBA-ACCELERATED COUPLED SOLVER")
     print("The first run may be slow due to JIT compilation.")
     print("="*80)
-    custom_domain = Domain(Nx=64, Ny=64, Nz=65) # Smaller grid for speed
+    custom_domain = Domain(Nx=128, Ny=128, Nz=129) # Smaller grid for speed
     custom_solver_params = SolverParams(save_frames=40)
     simulate_membrane_charging(dom=custom_domain, solver=custom_solver_params, use_coupled_solver=True)

@@ -159,32 +159,22 @@ class AMGPoissonSolver:
         self.ml = pyamg.smoothed_aggregation_solver(A, symmetry='symmetric')
 
     def solve(self, Vm, V_applied, dom):
-        """
-        Build RHS for current Vm and return φ (shape Nx,Ny,Nz).
-        """
         Nx, Ny, Nz = dom.Nx, dom.Ny, self.shape[2]
-        rhs = np.zeros(self.N, dtype=np.float64)
+        rhs3 = np.zeros(self.shape, dtype=np.float64)
 
-        def idx(i, j, k): return i + Nx*(j + Ny*k)
+        # Dirichlet planes: top/bottom
+        rhs3[:, :, 0]    = -V_applied/2.0
+        rhs3[:, :, -1]   =  V_applied/2.0
 
-        # top / bottom electrolyte planes
-        rhs_top    =  V_applied/2.0
-        rhs_bottom = -V_applied/2.0
-        for j in range(Ny):
-            for i in range(Nx):
-                rhs[idx(i, j, 0   )] = rhs_bottom
-                rhs[idx(i, j, Nz-1)] = rhs_top
+        # Dirichlet planes: membrane jump
+        rhs3[:, :, self.k_mem_minus] = -0.5 * Vm
+        rhs3[:, :, self.k_mem_plus ] =  0.5 * Vm
 
-        # membrane jump planes  (-Vm/2, +Vm/2)
-        for j in range(Ny):
-            for i in range(Nx):
-                rhs[idx(i, j, self.k_mem_minus)] = -Vm[i, j]/2.0
-                rhs[idx(i, j, self.k_mem_plus )] =  Vm[i, j]/2.0
-
-        # Solve the system
-        # Note: The order='F' is crucial because idx() uses Fortran/column-major ordering
-        phi_flat = self.ml.solve(rhs, tol=1e-10, maxiter=5)
+        # IMPORTANT: Fortran order to match idx()
+        rhs = rhs3.ravel(order="F")
+        phi_flat = self.ml.solve(rhs, tol=1e-10, maxiter=6)  # fewer its + warm start
         return phi_flat.reshape(self.shape, order="F")
+
     
 def create_grid(dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     """Creates the computational grid."""

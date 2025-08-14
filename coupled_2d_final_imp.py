@@ -504,7 +504,7 @@ if __name__ == "__main__":
         rebuild_vm_solver_every=25
     )
     # Start with a smaller initial pore to see dynamics
-    dynamic_phase = PhaseFieldParams(pore_radius=100e-9, mobility=5.0e8)
+    dynamic_phase = PhaseFieldParams(pore_radius=500e-9, mobility=5.0e8)
 
     simulate_membrane_charging(
         dom_in=custom_domain, 

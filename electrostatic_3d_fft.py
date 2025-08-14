@@ -1,527 +1,294 @@
-"""
-Refactored membrane charging simulation with a diffuse pore transition.
+# spectral_membrane_charging_fftw.py
+#
+# Fast membrane-charging loop using pyFFTW (threaded) for 2D FFTs.
+# Periodic in x,y; Dirichlet planes in z. We avoid solving φ everywhere:
+# compute J_elec directly in spectral space from Vm (closed-form, BOTH
+# electrolytes included), then update Vm (semi-implicit by default).
+#
+# J_hat(k) for k≠0:  J = -(1/2) * [σ κ (coth(κΔt)+coth(κΔb))] * Vm_hat
+# DC mode:           J_dc = (σ/2) * (Vapp - Vm_dc) * (1/Δt + 1/Δb)
 
-This script models the charging of a lipid membrane containing a central pore,
-using a phase-field approach to smoothly transition between lipid and pore properties.
-
-Key Features
-------------
-- Phase-field (psi): Represents lipid (psi=1) to pore (psi=0) state.
-- Smooth Blending: Electrical properties (conductance, capacitance) are blended
-  using a cubic Hermite polynomial H(psi) = psi^2 * (3 - 2*psi).
-- Regularization: A small bath capacitance is added to prevent division by zero
-  in the highly conductive pore region.
-- Numerical Stability: Optional lateral surface diffusion of the transmembrane
-  potential (Vm) is included for robustness.
-- Structure: The code is organized into small, testable functions with
-  clear data classes for parameters.
-
-Original Author: Saman Seifi
-Polished by: Gemini (August 1, 2025)
-"""
 from __future__ import annotations
-
+import os
 import numpy as np
-import matplotlib.pyplot as plt
 from dataclasses import dataclass
-from typing import Tuple
-from mpl_toolkits.axes_grid1 import make_axes_locatable
+from typing import Tuple, Optional
 
-# -----------------------------------------------------------------------------
-# Grid and Phase Field Utilities
-# -----------------------------------------------------------------------------
-# ------------------------------------------------------------
-# multigrid_phi.py  –  fast Poisson solver for membrane code
-# ------------------------------------------------------------
+# -------------------------
+# Optional pyFFTW backend
+# -------------------------
+_USE_FFTW = True
+try:
+    import pyfftw
+except Exception:
+    _USE_FFTW = False
 
-import pyamg
-from scipy.sparse import coo_matrix
+def _get_nthreads():
+    # Respect env if user set it; else use all logical cores.
+    s = os.environ.get("FFTW_NUM_THREADS") or os.environ.get("OMP_NUM_THREADS")
+    if s and s.isdigit():
+        return max(1, int(s))
+    try:
+        return max(1, os.cpu_count() or 1)
+    except Exception:
+        return 1
 
-# --- Physical Constants ---
-EPS0 = 8.8541878128e-12  # Vacuum permittivity, F/m
-EPS_W = 80.0 * EPS0      # Water permittivity, F/m
-
-# -----------------------------------------------------------------------------
-# Data Classes for Parameters
-# -----------------------------------------------------------------------------
-
-import numpy as np
-from numpy.fft import rfft2, irfft2
-
-class FFTPoissonSolver:
+# -------------------------
+# FFT wrapper (rfft2/irfft2)
+# -------------------------
+class RFFT2:
     """
-    Fast Laplace/Poisson solver for your membrane setup:
-
-      - periodic in x and y
-      - Dirichlet at z-planes: bottom, top, and the two membrane jump planes
-      - Solves ∇² φ = 0 (Laplace) in the two subdomains:
-          bottom: z ∈ [0, k_mem_minus]
-          top   : z ∈ [k_mem_plus, Nz-1]
-        with Dirichlet values imposed at both ends of each subdomain.
-      - The single middle plane (k_mid = (k_minus+k_plus)//2) is obtained from the
-        discrete stencil using the two membrane planes.
-
-    Usage:
-      solver = FFTPoissonSolver(dom, dx, dy, dz)
-      phi = solver.solve(Vm, V_applied, dom)
-
-    Returned shape: (Nx, Ny, Nz_actual) in real space.
+    Real 2D FFT wrapper. Uses pyFFTW if available, otherwise NumPy.
+    Keeps pre-allocated aligned arrays and FFTW plans.
     """
-    def __init__(self, dom, dx, dy, dz):
-        # Enforce odd Nz to keep a center plane at z=0
-        self.Nx, self.Ny = dom.Nx, dom.Ny
-        self.Nz = dom.Nz if dom.Nz % 2 else dom.Nz + 1
-        self.dx, self.dy, self.dz = dx, dy, dz
+    def __init__(self, Nx: int, Ny: int, nthreads: int | None = None, wisdom: bool = True):
+        self.Nx, self.Ny = Nx, Ny
+        self.nthreads = nthreads or _get_nthreads()
+        self.uses_fftw = _USE_FFTW
 
-        # Membrane planes just below/above z=0
-        self.k_mem_minus = self.Nz // 2 - 1
-        self.k_mem_plus  = self.Nz // 2 + 1
-        self.k_mid       = self.Nz // 2
+        if self.uses_fftw:
+            if wisdom:
+                try:
+                    pyfftw.import_wisdom(pyfftw.export_wisdom())
+                except Exception:
+                    pass
 
-        # Precompute spectral alpha(kx,ky) for periodic directions (discrete Laplacian eigenvalues)
-        # alpha = (2 - 2 cos(2π m/Nx))/dx^2 + (2 - 2 cos(2π n/Ny))/dy^2
-        m = np.arange(self.Nx)                 # x modes
-        n = np.arange(self.Ny // 2 + 1)        # rfft y modes
-        cosx = np.cos(2.0 * np.pi * m / self.Nx)[..., None]  # (Nx,1)
-        cosy = np.cos(2.0 * np.pi * n / self.Ny)[None, ...]  # (1,Ny_r)
-        self.alpha = (2.0 - 2.0 * cosx) / (dx*dx) + (2.0 - 2.0 * cosy) / (dy*dy)
-        # For the (0,0) mode, alpha == 0; code below naturally handles it.
+            # aligned working buffers
+            self._in   = pyfftw.empty_aligned((Nx, Ny), dtype='float64')
+            self._out  = pyfftw.empty_aligned((Nx, Ny//2 + 1), dtype='complex128')
+            self._rin  = pyfftw.empty_aligned((Nx, Ny//2 + 1), dtype='complex128')
+            self._rout = pyfftw.empty_aligned((Nx, Ny), dtype='float64')
 
-        # Coefficients for the 1D z-stencil
-        self.a = self.c = -1.0 / (dz*dz)       # sub/super-diagonal
-        # main diagonal depends on alpha: b = 2/dz^2 + alpha
+            # build plans (NOTE: no overwrite_input kw)
+            self._fw = pyfftw.builders.rfft2(
+                self._in, s=(Nx, Ny),
+                threads=self.nthreads,
+                planner_effort='FFTW_MEASURE'
+            )
+            self._bw = pyfftw.builders.irfft2(
+                self._rin, s=(Nx, Ny),
+                threads=self.nthreads,
+                planner_effort='FFTW_MEASURE'
+            )
+        else:
+            # NumPy fallback
+            self._in   = np.empty((Nx, Ny), dtype=np.float64)
+            self._out  = np.empty((Nx, Ny//2 + 1), dtype=np.complex128)
+            self._rin  = np.empty((Nx, Ny//2 + 1), dtype=np.complex128)
+            self._rout = np.empty((Nx, Ny), dtype=np.float64)
 
-    def _solve_segment_dirichlet(self, F_low, F_high, nz_seg, alpha):
-        """
-        Solve (for a *single* spectral mode) the 1D discrete Laplace in z with zero RHS:
-            a*z_{k-1} + b*z_k + c*z_{k+1} = 0,  k=1..nz_seg-2
-        Dirichlet endpoints: z_0 = F_low, z_{nz_seg-1} = F_high
-        where b = 2/dz^2 + alpha, a=c=-1/dz^2.
+    @property
+    def inarray(self):  return self._in
+    @property
+    def outarray(self): return self._out
 
-        Returns: z[0..nz_seg-1] for that mode (complex).
-        """
-        if nz_seg <= 2:
-            # Degenerate: just endpoints
-            return np.array([F_low, F_high], dtype=np.complex128)
+    def rfft2(self, real2d: np.ndarray) -> np.ndarray:
+        if self.uses_fftw:
+            np.copyto(self._in, real2d)
+            return self._fw()  # fills and returns self._out
+        else:
+            self._out[...] = np.fft.rfft2(real2d)
+            return self._out
 
-        dz = self.dz
-        a = self.a  # = -1/dz^2
-        c = self.c  # = -1/dz^2
-        b = 2.0/(dz*dz) + alpha
+    def irfft2(self, hat2d: np.ndarray) -> np.ndarray:
+        if self.uses_fftw:
+            np.copyto(self._rin, hat2d)
+            return self._bw()  # fills and returns self._rout
+        else:
+            self._rout[...] = np.fft.irfft2(hat2d, s=(self.Nx, self.Ny)).real
+            return self._rout
 
-        # Thomas algorithm on the (nz_seg-2) interior unknowns
-        n = nz_seg - 2
-        # Allocate
-        cp = np.empty(n, dtype=np.complex128)
-        dp = np.empty(n, dtype=np.complex128)
+# -------------------------
+# Physical constants
+# -------------------------
+EPS0 = 8.8541878128e-12
+EPS_W = 80.0 * EPS0
 
-        # RHS from Dirichlet boundaries
-        rhs0 = -a * F_low
-        rhsN = -c * F_high
-
-        # Forward sweep
-        denom = (b + 0j)  # ensure complex
-        cp[0] = -c / denom
-        dp[0] = rhs0 / denom
-        for k in range(1, n):
-            denom = (b + 0j) + a * cp[k-1]
-            cp[k] = -c / denom if k < n-1 else 0.0
-            dp[k] = (0.0 + (rhsN if k == n-1 else 0.0) + a * dp[k-1]) / denom
-
-        # Back substitution
-        z_int = np.empty(n, dtype=np.complex128)
-        z_int[-1] = dp[-1]
-        for k in range(n-2, -1, -1):
-            z_int[k] = dp[k] + cp[k] * z_int[k+1]
-
-        # Assemble full vector with endpoints
-        z = np.empty(nz_seg, dtype=np.complex128)
-        z[0] = F_low
-        z[-1] = F_high
-        z[1:-1] = z_int
-        return z
-
-    def solve(self, Vm, V_applied, dom):
-        """
-        Compute φ with:
-          φ(x,y,z=bottom)        = -V_applied/2
-          φ(x,y,z=top)           = +V_applied/2
-          φ(x,y,z=k_mem_minus)   = -Vm(x,y)/2
-          φ(x,y,z=k_mem_plus)    = +Vm(x,y)/2
-        Periodic in x,y.
-
-        Vm: shape (Nx,Ny), real
-        Returns: phi of shape (Nx,Ny,Nz)
-        """
-        Nx, Ny, Nz = self.Nx, self.Ny, self.Nz
-        assert Vm.shape == (Nx, Ny)
-
-        # Boundary planes in real space
-        plane_bottom = np.full((Nx, Ny), -0.5 * V_applied, dtype=np.float64)
-        plane_top    = np.full((Nx, Ny),  0.5 * V_applied, dtype=np.float64)
-        plane_minus  = -0.5 * Vm
-        plane_plus   =  0.5 * Vm
-
-        # rFFT of boundary planes (periodic)
-        Fb = rfft2(plane_bottom, axes=(0, 1))
-        Ft = rfft2(plane_top,    axes=(0, 1))
-        Fm = rfft2(plane_minus,  axes=(0, 1))
-        Fp = rfft2(plane_plus,   axes=(0, 1))
-
-        # Allocate spectral containers for the two segments
-        nz_bot = self.k_mem_minus - 0 + 1
-        nz_top = (Nz - 1) - self.k_mem_plus + 1
-        Fphi_bot = np.empty((Nx, Ny//2 + 1, nz_bot), dtype=np.complex128)
-        Fphi_top = np.empty((Nx, Ny//2 + 1, nz_top), dtype=np.complex128)
-
-        # Solve per (kx,ky) mode — loops in pure NumPy are okay; this is still very fast.
-        for ix in range(Nx):
-            for jy in range(Ny//2 + 1):
-                alpha = self.alpha[ix, jy]
-
-                # Bottom segment: z ∈ [0 .. k_mem_minus], endpoints: Fb, Fm
-                Fseg_bot = self._solve_segment_dirichlet(Fb[ix, jy], Fm[ix, jy], nz_bot, alpha)
-                Fphi_bot[ix, jy, :] = Fseg_bot
-
-                # Top segment: z ∈ [k_mem_plus .. Nz-1], endpoints: Fp, Ft
-                Fseg_top = self._solve_segment_dirichlet(Fp[ix, jy], Ft[ix, jy], nz_top, alpha)
-                Fphi_top[ix, jy, :] = Fseg_top
-
-        # Inverse transforms back to real space
-        phi = np.empty((Nx, Ny, Nz), dtype=np.float64)
-
-        # Bottom block
-        for k, kk in enumerate(range(0, self.k_mem_minus + 1)):
-            phi[:, :, kk] = irfft2(Fphi_bot[:, :, k], s=(Nx, Ny), axes=(0, 1)).real
-
-        # Top block
-        for k, kk in enumerate(range(self.k_mem_plus, Nz)):
-            phi[:, :, kk] = irfft2(Fphi_top[:, :, k], s=(Nx, Ny), axes=(0, 1)).real
-
-        # Middle (single) plane at k_mid from discrete stencil:
-        #    -(1/dz^2) φ_- + (2/dz^2 + alpha) φ_mid -(1/dz^2) φ_+ = 0
-        # ⇒  φ_mid_hat = (φ_-hat + φ_+hat) / (2 + alpha*dz^2)
-        # Do this in spectral space for accuracy, then inverse transform.
-        Fminus = Fm
-        Fplus  = Fp
-        denom  = (2.0 + self.alpha * (self.dz * self.dz))
-        Fmid   = (Fminus + Fplus) / denom
-        phi[:, :, self.k_mid] = irfft2(Fmid, s=(Nx, Ny), axes=(0, 1)).real
-
-        return phi
-
-
+# -------------------------
+# Parameters
+# -------------------------
 @dataclass
 class Domain:
-    """Parameters defining the simulation domain and grid."""
-    Lx: float = 1000e-9
-    Ly: float = 1000e-9
-    Lz: float = 2000e-9
+    Lx: float = 10_000e-9
+    Ly: float = 10_000e-9
+    Lz: float = 20_000e-9
     Nx: int = 128
     Ny: int = 128
-    Nz: int = 129  # Will be forced to an odd number
+    Nz: int = 129   # odd → centered membrane region
 
 @dataclass
 class MembraneProps:
-    """Intrinsic electrical properties of the membrane components."""
-    R_lipid: float = 1e7   # Lipid resistance, Ohm·m^2
-    C_lipid: float = 1e-2  # Lipid capacitance, F/m^2
-    R_pore: float = 1e-1   # Pore resistance (conductive), Ohm·m^2
-    C_pore: float = 1e-9   # Pore capacitance (near zero), F/m^2
+    R_lipid: float = 1e7     # Ohm·m^2
+    C_lipid: float = 1e-2    # F/m^2
+    R_pore: float = 1e-1     # Ohm·m^2
+    C_pore: float = 1e-9     # F/m^2
 
 @dataclass
 class PhaseFieldParams:
-    """Parameters for the phase-field model of the pore."""
-    pore_radius: float = 10e-9
-    transition_thickness: float | None = None  # If None, defaults to 2*dx
+    pore_radius: float = 500e-9
+    transition_thickness: float | None = None  # defaults to 2*dx
 
 @dataclass
 class Electrostatics:
-    """Parameters for the electrostatic environment."""
-    sigma_e: float = 1.0    # Electrolyte conductivity, S/m
-    V_applied: float = 0.5  # Applied voltage across the box, V
+    sigma_e: float = 1.0     # S/m
+    V_applied: float = 0.5   # V
 
 @dataclass
 class SolverParams:
-    """Parameters controlling the numerical solver."""
-    max_iters_phi: int = 2000
-    tolerance: float = 1e-6
     surface_diffusion: bool = True
-    D_V: float = 0.0          # If 0, set adaptively
-    dt_safety: float = 0.01   # Safety factor for time step
-    n_tau_total: float = 8.0  # Total simulation time in units of lipid RC time
-    save_frames: int = 20     # Number of frames to save for visualization
+    D_V: float = 0.0              # if 0, set adaptively
+    dt_safety: float = 0.01
+    n_tau_total: float = 8.0
+    save_frames: int = 20
+    print_every: int = 25
+    nthreads_fft: Optional[int] = None  # threads for FFTW
 
-
-
-def _build_laplacian_SPD(dom, dx, dy, dz, k_mem_minus, k_mem_plus):
-    """
-    Assemble a sparse 7-point 3-D Laplacian with corrected Neumann BCs.
-    """
-    Nx, Ny, Nz = dom.Nx, dom.Ny, dom.Nz
-    dx2, dy2, dz2 = dx*dx, dy*dy, dz*dz
-    diag_vals, row_idx, col_idx = [], [], []
-
-    def idx(i, j, k):
-        return i + Nx*(j + Ny*k)
-    
-    def _nbor_i(i, Nx):
-        # periodic wrap
-        return (i-1) % Nx, (i+1) % Nx
-
-    def _nbor_j(j, Ny):
-        return (j-1) % Ny, (j+1) % Ny
-
-    for k in range(Nz):
-        for j in range(Ny):
-            for i in range(Nx):
-                p = idx(i, j, k)
-
-                # --- Dirichlet planes (unchanged) ---
-                if k in (0, Nz-1, k_mem_minus, k_mem_plus):
-                    row_idx.append(p); col_idx.append(p); diag_vals.append(1.0)
-                    continue
-
-                # --- Interior / Neumann ---
-                diag = 0.0
-
-                # --- x-direction (periodic) ---
-                il, ir = _nbor_i(i, Nx)
-                for q in (idx(il, j, k), idx(ir, j, k)):
-                    row_idx.append(p); col_idx.append(q); diag_vals.append(-1.0/dx2)
-                diag += 2.0/dx2
-
-                # --- y-direction (periodic) ---
-                jb, jt = _nbor_j(j, Ny)
-                for q in (idx(i, jb, k), idx(i, jt, k)):
-                    row_idx.append(p); col_idx.append(q); diag_vals.append(-1.0/dy2)
-                diag += 2.0/dy2
-
-                # --- z-direction (always interior) ---
-                for q in (idx(i, j, k-1), idx(i, j, k+1)):
-                    row_idx.append(p); col_idx.append(q); diag_vals.append(-1.0/dz2)
-                diag += 2.0/dz2
-
-                # set final diagonal
-                row_idx.append(p); col_idx.append(p); diag_vals.append(diag)
-
-    A = coo_matrix((diag_vals, (row_idx, col_idx)),
-                   shape=(Nx*Ny*Nz, Nx*Ny*Nz), dtype=np.float64).tocsr()
-    return A
-
-
-class AMGPoissonSolver:
-    """Build once, reuse each Δt."""
-    def __init__(self, dom, dx, dy, dz):
-        Nz = dom.Nz if dom.Nz % 2 else dom.Nz + 1
-        self.k_mem_minus = Nz//2 - 1
-        self.k_mem_plus  = Nz//2 + 1
-        self.N = dom.Nx * dom.Ny * Nz
-        self.shape = (dom.Nx, dom.Ny, Nz)
-
-        # Build the corrected matrix
-        A = _build_laplacian_SPD(dom, dx, dy, dz,
-                                 self.k_mem_minus, self.k_mem_plus)
-        self.ml = pyamg.smoothed_aggregation_solver(A, symmetry='symmetric')
-
-    def solve(self, Vm, V_applied, dom):
-        """
-        Build RHS for current Vm and return φ (shape Nx,Ny,Nz).
-        """
-        Nx, Ny, Nz = dom.Nx, dom.Ny, self.shape[2]
-        rhs = np.zeros(self.N, dtype=np.float64)
-
-        def idx(i, j, k): return i + Nx*(j + Ny*k)
-
-        # top / bottom electrolyte planes
-        rhs_top    =  V_applied/2.0
-        rhs_bottom = -V_applied/2.0
-        for j in range(Ny):
-            for i in range(Nx):
-                rhs[idx(i, j, 0   )] = rhs_bottom
-                rhs[idx(i, j, Nz-1)] = rhs_top
-
-        # membrane jump planes  (-Vm/2, +Vm/2)
-        for j in range(Ny):
-            for i in range(Nx):
-                rhs[idx(i, j, self.k_mem_minus)] = -Vm[i, j]/2.0
-                rhs[idx(i, j, self.k_mem_plus )] =  Vm[i, j]/2.0
-
-        # Solve the system
-        # Note: The order='F' is crucial because idx() uses Fortran/column-major ordering
-        phi_flat = self.ml.solve(rhs, tol=1e-10, maxiter=5)
-        return phi_flat.reshape(self.shape, order="F")
-    
+# -------------------------
+# Grid & helpers
+# -------------------------
 def create_grid(dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
-    """Creates the computational grid."""
-    Nx, Ny, Nz = dom.Nx, dom.Ny, dom.Nz if dom.Nz % 2 else dom.Nz + 1
-    x = np.linspace(-dom.Lx / 2, dom.Lx / 2, Nx)
-    y = np.linspace(-dom.Ly / 2, dom.Ly / 2, Ny)
-    z = np.linspace(-dom.Lz / 2, dom.Lz / 2, Nz)
+    Nx, Ny = dom.Nx, dom.Ny
+    Nz = dom.Nz if dom.Nz % 2 else dom.Nz + 1
+    # Periodic in x,y → avoid endpoint to fit FFT grid naturally
+    x = np.linspace(-dom.Lx/2, dom.Lx/2, Nx, endpoint=False)
+    y = np.linspace(-dom.Ly/2, dom.Ly/2, Ny, endpoint=False)
+    z = np.linspace(-dom.Lz/2, dom.Lz/2, Nz)
     dx, dy, dz = x[1] - x[0], y[1] - y[0], z[1] - z[0]
     return x, y, z, dx, dy, dz
 
 def smooth_step(psi: np.ndarray) -> np.ndarray:
-    """
-    Computes a cubic Hermite smooth step function H(psi) = psi^2 * (3 - 2*psi).
-
-    This provides a smooth transition from H(0)=0 to H(1)=1 with zero
-    derivatives at the endpoints.
-    """
-    return psi**2 * (3.0 - 2.0 * psi)
+    return psi**2 * (3.0 - 2.0*psi)
 
 def build_phase_field(x: np.ndarray, y: np.ndarray, pore_radius: float, ell: float) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Constructs the phase field `psi` and the smoothed field `H`.
-
-    Args:
-        x: 1D array of x-coordinates.
-        y: 1D array of y-coordinates.
-        pore_radius: The radius of the central pore.
-        ell: The characteristic thickness of the pore-lipid transition.
-
-    Returns:
-        A tuple containing the phase field `psi` (0=pore, 1=lipid) and the
-        smoothed field `H(psi)`.
-    """
     xx, yy = np.meshgrid(x, y, indexing="ij")
     r = np.sqrt(xx**2 + yy**2)
-    # tanh provides a smooth profile for the phase field
-    psi = 0.5 * (1.0 + np.tanh((r - pore_radius) / (np.sqrt(2.0) * ell)))
+    psi = 0.5*(1.0 + np.tanh((r - pore_radius)/(np.sqrt(2.0)*ell)))
     H = smooth_step(psi)
     return psi, H
 
 def blend_properties(H: np.ndarray, props: MembraneProps, dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Blends material properties based on the phase field and adds bath capacitance.
-
-    Returns:
-        A tuple of (G_m_map, C_m_map, C_eff_map) representing the spatial maps of
-        membrane conductance, membrane capacitance, and effective capacitance.
-    """
-    G_lipid, G_pore = 1.0 / props.R_lipid, 1.0 / props.R_pore
-    # Linearly interpolate properties between pore and lipid values using H
+    G_lipid, G_pore = 1.0/props.R_lipid, 1.0/props.R_pore
     G_m_map = G_pore + (G_lipid - G_pore) * H
     C_m_map = props.C_pore + (props.C_lipid - props.C_pore) * H
-    # Geometric capacitance of the electrolyte columns on either side of the membrane
     C_bath = 2.0 * EPS_W / dom.Lz
-    # The effective capacitance includes the bath capacitance to regularize the ODE
     C_eff_map = C_bath + C_m_map
     return G_m_map, C_m_map, C_eff_map
 
-# -----------------------------------------------------------------------------
-# Numerical Solvers and Time Stepping
-# -----------------------------------------------------------------------------
-
-def estimate_time_step(G_m_map: np.ndarray, C_eff_map: np.ndarray, elec: Electrostatics, dom: Domain, solver: SolverParams) -> Tuple[float, float, int]:
-    """
-    Estimates a stable time step `dt` for the explicit time integration.
-
-    The estimate is based on the stiffest (fastest) local RC time constant in the
-    system, including contributions from electrolyte conductivity.
-    """
+def estimate_time_step(G_m_map: np.ndarray, C_eff_map: np.ndarray, elec: Electrostatics,
+                       dom: Domain, solver: SolverParams) -> Tuple[float, float, int]:
     A = 2.0 * elec.sigma_e / dom.Lz
-    # Estimate the maximum rate of change in the system
     rate_max = (A + np.max(G_m_map)) / np.min(C_eff_map)
     tau_local_min = 1.0 / rate_max
     dt = solver.dt_safety * tau_local_min
-
-    # Calculate total simulation time based on the lipid charging time constant
     tau_report = np.max(C_eff_map) / (A + np.max(G_m_map))
     total_time = solver.n_tau_total * tau_report
     nsteps = int(np.ceil(total_time / dt))
     return dt, total_time, nsteps
 
-def laplacian2d_neumann(field: np.ndarray, dx: float) -> np.ndarray:
-    """
-    Computes the 2D Laplacian of a field with zero-flux (Neumann) boundaries.
-    Assumes dx = dy.
-    """
-    # Pad the field by copying edge values to implement Neumann condition
-    padded = np.pad(field, pad_width=1, mode='edge')
-    lap = (
-        padded[2:, 1:-1] +    # North
-        padded[:-2, 1:-1] +   # South
-        padded[1:-1, 2:] +    # East
-        padded[1:-1, :-2] -   # West
-        4 * field
-    )
-    return lap / (dx**2)
+def laplacian2d_neumann_like(field: np.ndarray, dx: float) -> np.ndarray:
+    # For optional surface smoothing of Vm (acts like Neumann reflection at edges)
+    Nx, Ny = field.shape
+    lap = np.empty_like(field)
+    dx2 = dx*dx
+    for i in range(Nx):
+        im1 = i-1 if i>0 else 1
+        ip1 = i+1 if i<Nx-1 else Nx-2
+        for j in range(Ny):
+            jm1 = j-1 if j>0 else 1
+            jp1 = j+1 if j<Ny-1 else Ny-2
+            lap[i,j] = (field[ip1,j]+field[im1,j]+field[i,jp1]+field[i,jm1]-4*field[i,j])/dx2
+    return lap
 
-def update_vm(Vm: np.ndarray, G_m_map: np.ndarray, C_eff_map: np.ndarray, H: np.ndarray, elec: Electrostatics, dom: Domain, dt: float, dx: float, solver: SolverParams) -> np.ndarray:
-    """
-    Updates the transmembrane potential `Vm` for one time step using explicit Euler.
-    """
-    # Driving current from the external field, scaled by H so it only affects the membrane
-    J_elec = H * (2.0 * elec.sigma_e * (elec.V_applied - Vm) / dom.Lz)
-
-    # Add a short-circuit conductance in the pore (where H~0) to drive Vm->0
-    base_G_sc = 2.0 * elec.sigma_e / dom.Lz
+def update_vm_semiimplicit(Vm, G_m, C_eff, H, dt, dx, sigma, Vapp, Lz,
+                           surface_diffusion, D_V, J_elec):
+    base_G_sc = 2.0 * sigma / Lz
+    # Consider reducing alpha if Vm looks clamped; alpha=50 is conservative.
     G_sc = 50.0 * base_G_sc * (1.0 - H)
-
-    # Time derivative of Vm from the cable equation
-    dVm_dt = (J_elec - (G_m_map + G_sc) * Vm) / C_eff_map
-    Vm_new = Vm + dt * dVm_dt
-
-    # Add optional surface diffusion for numerical stability
-    if solver.surface_diffusion and solver.D_V > 0.0:
-        lap = laplacian2d_neumann(Vm_new, dx)
-        Vm_new += dt * solver.D_V * lap
+    Gtot = G_m + G_sc
+    num = C_eff*Vm + dt*(J_elec)           # J at n+1 (from spectral formula this step)
+    den = C_eff + dt*Gtot
+    Vm_new = num/den
+    if surface_diffusion and D_V>0:
+        Vm_new += dt * D_V * laplacian2d_neumann_like(Vm_new, dx)
     return Vm_new
 
-# -----------------------------------------------------------------------------
-# Visualization and Main Driver
-# -----------------------------------------------------------------------------
+# -------------------------
+# Spectral J-only (pyFFTW)
+# -------------------------
+class SpectralJComputer:
+    """
+    Computes J_elec from Vm without building φ, including BOTH electrolytes:
+      Non-DC: J_hat = -(1/2)*σ*κ*(coth(κΔt)+coth(κΔb)) * Vm_hat
+      DC:     J_dc  =  (σ/2)*(Vapp - Vm_dc)*(1/Δt + 1/Δb)
+    Vectorized with rFFT2/irFFT2 and precomputed κ and coth terms.
+    """
+    def __init__(self, dom: Domain, z_plus_idx: int, z_top_idx: int, nthreads_fft: Optional[int] = None):
+        Nx, Ny = dom.Nx, dom.Ny
+        Lx, Ly = dom.Lx, dom.Ly
+        self.Nx, self.Ny = Nx, Ny
+        self.z_plus_idx = z_plus_idx
+        self.z_top_idx = z_top_idx
 
-def plot_results(x: np.ndarray, y: np.ndarray, z: np.ndarray, Vm: np.ndarray, phi: np.ndarray, time_points: list[float], avg_Vm_vs_time: list[float]) -> None:
-    """Generates and displays plots of the simulation results."""
-    fig = plt.figure(figsize=(24, 7))
-    x_nm, y_nm, z_nm = x * 1e9, y * 1e9, z * 1e9
-    time_ns = np.array(time_points) * 1e9
+        # rFFT frequencies: full in x, half in y
+        kx = 2*np.pi*np.fft.fftfreq(Nx, d=Lx/Nx)            # shape (Nx,)
+        ky = 2*np.pi*np.fft.rfftfreq(Ny, d=Ly/Ny)           # shape (Ny//2+1,)
+        KX, KY = np.meshgrid(kx, ky, indexing='ij')         # (Nx, Ny//2+1)
+        self.K = np.sqrt(KX*KX + KY*KY)
 
-    # 1) Average Vm vs. Time
-    ax1 = fig.add_subplot(1, 3, 1)
-    ax1.plot(time_ns, avg_Vm_vs_time, marker="o", linestyle="-")
-    ax1.set_xlabel("Time (ns)")
-    ax1.set_ylabel("Average Transmembrane Potential (V)")
-    ax1.set_title("Average $V_m$ Charging Curve")
-    ax1.grid(True, linestyle='--')
+        # FFT plans/buffers
+        self.fft = RFFT2(Nx, Ny, nthreads=nthreads_fft)
 
-    # 2) Final Vm spatial map
-    ax2 = fig.add_subplot(1, 3, 2)
-    im2 = ax2.imshow(Vm.T, origin="lower", extent=[x_nm[0], x_nm[-1], y_nm[0], y_nm[-1]], cmap="magma")
-    ax2.set_xlabel("x-position (nm)")
-    ax2.set_ylabel("y-position (nm)")
-    ax2.set_title("Final $V_m$ Distribution")
-    div2 = make_axes_locatable(ax2)
-    cax2 = div2.append_axes("right", size="5%", pad=0.1)
-    fig.colorbar(im2, cax=cax2, label="Voltage (V)")
+        # Placeholders allocated once
+        self._Vm_hat = self.fft.outarray      # complex (Nx, Ny//2+1)
+        self._J_hat  = np.empty_like(self._Vm_hat)
 
-    # 3) 2D slice of the full potential phi
-    ax3 = fig.add_subplot(1, 3, 3)
-    y_slice_idx = phi.shape[1] // 2
-    im3 = ax3.imshow(phi[:, y_slice_idx, :].T, origin="lower", extent=[x_nm[0], x_nm[-1], z_nm[0], z_nm[-1]], aspect="auto", cmap="viridis")
-    ax3.axhline(0.0, color="r", linestyle="--", label="Membrane Plane")
-    ax3.set_xlabel("x-position (nm)")
-    ax3.set_ylabel("z-position (nm)")
-    ax3.set_title(f"Final Potential $\\phi(x, y={y_nm[y_slice_idx]:.1f}, z)$")
-    ax3.legend()
-    div3 = make_axes_locatable(ax3)
-    cax3 = div3.append_axes("right", size="5%", pad=0.1)
-    fig.colorbar(im3, cax=cax3, label="Potential (V)")
+        # caches for coth terms
+        self._coth_cache_valid = False
+        self._Delta_top_cached = None
+        self._Delta_bot_cached = None
 
-    plt.tight_layout()
-    plt.show()
+    def compute_J(self, Vm: np.ndarray, sigma: float, V_applied: float,
+                  Delta_top: float, Delta_bot: float) -> np.ndarray:
+        """
+        Correct membrane current J_elec including top and bottom electrolytes.
+        """
+        # cache coth for both distances
+        if (self._Delta_top_cached != Delta_top or
+            self._Delta_bot_cached != Delta_bot or
+            not self._coth_cache_valid):
+            K = self.K
+            self._coth_t = np.zeros_like(K)
+            self._coth_b = np.zeros_like(K)
+            mask = (K > 0)
+            self._coth_t[mask] = 1.0 / np.tanh(K[mask] * Delta_top)
+            self._coth_b[mask] = 1.0 / np.tanh(K[mask] * Delta_bot)
+            self._Delta_top_cached = Delta_top
+            self._Delta_bot_cached = Delta_bot
+            self._coth_cache_valid = True
 
+        Vm_hat = self.fft.rfft2(Vm)  # (Nx, Ny//2+1)
+
+        # Non-DC modes: Yacc = σ κ (coth_t + coth_b)
+        Yacc = sigma * self.K * (self._coth_t + self._coth_b)
+        self._J_hat[:] = -0.5 * Yacc * Vm_hat
+
+        # DC correction (overwrite [0,0])
+        Vm_dc = Vm_hat[0, 0].real
+        J_dc = 0.5 * sigma * (V_applied - Vm_dc) * (1.0/Delta_top + 1.0/Delta_bot)
+        self._J_hat[0, 0] = J_dc
+
+        return self.fft.irfft2(self._J_hat)
+
+# -------------------------
+# Main driver
+# -------------------------
 def simulate_membrane_charging(
     dom: Domain | None = None,
     props: MembraneProps | None = None,
     phase: PhaseFieldParams | None = None,
     elec: Electrostatics | None = None,
     solver: SolverParams | None = None,
-) -> None:
-    """Main driver for the membrane charging simulation."""
-    # --- 1. Initialization ---
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     dom = dom if dom is not None else Domain()
     props = props if props is not None else MembraneProps()
     phase = phase if phase is not None else PhaseFieldParams()
@@ -529,76 +296,68 @@ def simulate_membrane_charging(
     solver = solver if solver is not None else SolverParams()
 
     x, y, z, dx, dy, dz = create_grid(dom)
-    phi_solver = FFTPoissonSolver(dom, dx, dy, dz)   # <- NEW
+    Nz = z.size
 
-    Nz_actual = z.shape[0]
-    ell = phase.transition_thickness if phase.transition_thickness is not None else (2.0 * dx)
+    # Membrane bracketing planes
+    km_minus = Nz//2 - 1
+    km_plus  = Nz//2 + 1
 
-    # --- 2. Build Model ---
+    # distances from membrane planes to electrodes
+    Delta_top = z[-1]       - z[km_plus]   # meters
+    Delta_bot = z[km_minus] - z[0]         # meters
+
+    ell = phase.transition_thickness if phase.transition_thickness is not None else (2.0*dx)
     psi, H = build_phase_field(x, y, phase.pore_radius, ell)
     G_m_map, C_m_map, C_eff_map = blend_properties(H, props, dom)
     dt, total_time, nsteps = estimate_time_step(G_m_map, C_eff_map, elec, dom, solver)
 
     if solver.surface_diffusion and solver.D_V == 0.0:
-        # Adaptively set D_V for numerical stability if not user-specified
-        solver.D_V = 0.05 * dx**2 / dt
+        solver.D_V = 0.05 * dx*dx / dt
 
-    print("--- Membrane Charging Simulation Setup ---")
-    print(f"Grid: {dom.Nx}x{dom.Ny}x{Nz_actual} (dx={dx*1e9:.2f} nm)")
-    print(f"Pore Radius: {phase.pore_radius*1e9:.1f} nm, Transition: {ell*1e9:.2f} nm (~{ell/dx:.2f} dx)")
-    tau_report = total_time / solver.n_tau_total
-    print(f"System Time Constant (τ_lipid): {tau_report*1e9:.2f} ns")
-    print(f"Simulation Time: {total_time*1e6:.2f} µs ({solver.n_tau_total:.1f} τ_lipid)")
-    print(f"Stable Time Step (dt): {dt*1e9:.3f} ns ({nsteps} steps)")
-    if solver.surface_diffusion:
-        print(f"Surface Diffusion Enabled: D_V = {solver.D_V:.3e} m^2/s")
-    print("-" * 40)
+    # pyFFTW-based spectral J
+    Jcomp = SpectralJComputer(dom, z_plus_idx=km_plus, z_top_idx=Nz-1, nthreads_fft=solver.nthreads_fft)
 
-    # --- 3. Run Simulation ---
-    Vm = np.zeros((dom.Nx, dom.Ny), dtype=float)
-    phi = np.zeros((dom.Nx, dom.Ny, Nz_actual), dtype=float)
-    k_mem = Nz_actual // 2
-    assert np.isclose(z[k_mem], 0.0), "Membrane plane z=0 is not at the grid center."
+    Vm = np.zeros((dom.Nx, dom.Ny), dtype=np.float64)
 
-    time_points, avg_Vm_vs_time = [], []
+    time_points = []
+    avg_Vm_vs_time = []
+
     save_interval = max(1, nsteps // solver.save_frames)
 
+    print(f"[FFTs] Using {'pyFFTW' if _USE_FFTW else 'NumPy'} with {Jcomp.fft.nthreads if _USE_FFTW else 1} thread(s)")
+    print(f"Grid: {dom.Nx}x{dom.Ny}x{Nz} (dx={dx*1e9:.2f} nm), periodic x,y")
+    print(f"Pore R={phase.pore_radius*1e9:.1f} nm, trans.={ell*1e9:.1f} nm")
+    print(f"dt={dt*1e9:.3f} ns, steps={nsteps}, τ≈{(total_time/solver.n_tau_total)*1e9:.2f} ns")
+
     for n in range(nsteps):
-        Vm = update_vm(Vm, G_m_map, C_eff_map, H, elec, dom, dt, dx, solver)
+        # 1) Compute J_elec directly from Vm (two-sided spectral closed form)
+        J_elec = Jcomp.compute_J(Vm, elec.sigma_e, elec.V_applied, Delta_top, Delta_bot)
 
-        # Note: Solving for phi at each step is computationally expensive.
-        # For this model, phi is primarily for visualization of the final state.
-        # It's calculated here every step but could be moved outside the loop.
-        # phi, iters = solve_phi(phi, Vm, k_mem, elec.V_applied, dx**2, dy**2, dz**2, solver.tolerance, solver.max_iters_phi)
-        phi = phi_solver.solve(Vm, elec.V_applied, dom)
+        # 2) Semi-implicit Vm update (unconditionally stable to the sink term)
+        Vm = update_vm_semiimplicit(
+            Vm, G_m_map, C_eff_map, H, dt, dx,
+            elec.sigma_e, elec.V_applied, dom.Lz,
+            solver.surface_diffusion, solver.D_V, J_elec
+        )
 
-
-        if n % save_interval == 0 or n == nsteps - 1:
-            t = (n + 1) * dt
-            avg_Vm = float(np.mean(Vm))
+        if (n % save_interval == 0) or (n == nsteps-1):
+            t = (n+1)*dt
             time_points.append(t)
-            avg_Vm_vs_time.append(avg_Vm)
-            iters = getattr(getattr(phi_solver, 'ml', None), 'iteration_count', 'FFT')
-            print(f"Time: {t*1e9:8.2f} ns [{n+1:>{len(str(nsteps))}}/{nsteps}] | Avg Vm: {avg_Vm:.4f} V | Iterations: {iters}")
-    # --- 4. Output Results ---
-    print("\nSimulation finished. Generating plots...")
-    plot_results(x, y, z, Vm, phi, time_points, avg_Vm_vs_time)
+            avg_Vm_vs_time.append(float(np.mean(Vm)))
+            if ((n % max(1, solver.print_every)) == 0) or (n == nsteps-1):
+                print(f"Step {n+1:>6}/{nsteps}  t={t*1e9:8.2f} ns  <Vm>={avg_Vm_vs_time[-1]:.4f} V")
 
-    # Save results to a compressed .npz file
-    np.savez_compressed(
-        "membrane_charging_results_multigrid.npz",
-        x=x, y=y, z=z, Vm=Vm, phi=phi, H=H,
-        time_points=np.array(time_points),
-        avg_Vm_vs_time=np.array(avg_Vm_vs_time)
-    )
-    print("Results saved to membrane_charging_results.npz")
+    # Return arrays for plotting/saving
+    return x, y, z, Vm
 
-
+# -------------------------
+# Run example
+# -------------------------
 if __name__ == "__main__":
-    # To run with default parameters, simply call the function:
-    simulate_membrane_charging()
-
-    # Example of running with custom parameters:
-    # custom_phase = PhaseFieldParams(pore_radius=10e-9)
-    # custom_solver = SolverParams(n_tau_total=5.0, surface_diffusion=False)
-    # simulate_membrane_charging(phase=custom_phase, solver=custom_solver)
+    # Tip: set threads, e.g.:
+    #   export FFTW_NUM_THREADS=16
+    #   export OMP_NUM_THREADS=16
+    dom = Domain(Nx=64, Ny=64, Nz=65)
+    solver = SolverParams(save_frames=40, print_every=50, nthreads_fft=16)
+    x, y, z, Vm = simulate_membrane_charging(dom=dom, solver=solver)
+    np.savez_compressed("membrane_fftw_Jonly.npz", x=x, y=y, z=z, Vm=Vm)
