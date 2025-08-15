@@ -1,36 +1,34 @@
 """
 Dynamic membrane pore simulation with coupled electrostatics and phase-field evolution.
+This version includes stochastic thermal noise to model pore nucleation.
 
 This script models the charging of a lipid membrane containing a central pore that
 can change in size and shape over time. It couples two main physical models:
 
 1.  **Phase-Field Dynamics:** The pore's structure is represented by a phase-field
     variable `psi` (lipid=1, pore=0). The evolution of `psi` is governed by the
-    Cahn-Hilliard equation, driven by physical line tension. This is solved
-    efficiently using a spectral (FFT-based) method.
+    stochastic Allen-Cahn equation, driven by line tension, a dynamic,
+    voltage-dependent surface tension, and thermal fluctuations.
 
 2.  **Coupled Electrostatics:** The electrical behavior is modeled using a fully
     coupled, semi-implicit solver. The 3D electrolyte potential (`phi_elec`) and
     the 2D transmembrane potential (`Vm`) are solved self-consistently.
 
 The coupling is bidirectional: the pore's shape determines the local electrical
-properties (resistance, capacitance), and in turn, the electric field can
-influence the pore's evolution (this extension can be added later).
-
-This version uses a numerically stable semi-implicit scheme for both the phase-field
-and the Vm updates, allowing for large time steps and efficient simulation of
-the coupled system.
+properties, and in turn, the electric field adds an electromechanical surface
+tension that lowers the energy barrier for thermal nucleation and drives pore expansion.
 
 Key Features
 ------------
-- Dynamic Phase-Field: The pore evolves based on line tension.
+- Stochastic Pore Nucleation: Thermodynamically consistent noise is added to the
+  phase-field evolution to simulate spontaneous pore formation.
+- Dynamic Phase-Field: The pore evolves based on line tension and electrical stress.
 - Coupled Solvers: The phase-field evolution and electrostatics are solved in the same time loop.
 - Implicit Vm Solver: A `ImplicitVMSolver` class handles the stable time
-  evolution of Vm. The operator is rebuilt periodically to account for changes in pore shape.
+  evolution of Vm. The operator is rebuilt periodically.
 - Numba & FFTW: Core loops are JIT-compiled with Numba, and spectral methods use FFTs for speed.
 
-Original Author: Saman Seifi
-Refactored and Integrated by: Gemini (August 11, 2025)
+Author: Saman Seifi
 """
 from __future__ import annotations
 
@@ -44,6 +42,8 @@ import numba
 import pyamg
 from scipy.sparse import coo_matrix, csc_matrix
 from scipy.sparse.linalg import factorized
+## MODIFICATION: Import the 'label' function to find connected pore regions
+from scipy.ndimage import label
 
 # --- Physical Constants ---
 EPS0 = 8.8541878128e-12  # Vacuum permittivity, F/m
@@ -75,17 +75,24 @@ class MembraneProps:
 class PhaseFieldParams:
     """Parameters for the phase-field model of the pore."""
     # --- Initial State ---
-    pore_radius: float = 500e-9
-    transition_thickness: float | None = None  # If None, defaults to 2*dx
+    pore_radius: float = 500e-9 # Used only if not starting from intact patch
+    transition_thickness: float | None = None  # If None, defaults to 0.5*dx
     # --- Dynamics ---
     line_tension: float = 1.5e-11 # J/m, aka 'gamma'
     mobility: float = 5000.0      # m^2/(J*s), aka 'M'
-    sigma_area: float = 0.0       # J/m^2, area-dependent energy term
+    sigma_area: float = 0.0       # J/m^2, base membrane tension (sigma_0)
+
+@dataclass
+class ThermalParams:
+    """Parameters for thermal fluctuations."""
+    T: float = 300.0  # Temperature in Kelvin
+    k_B: float = 1.380649e-23  # Boltzmann constant, J/K
+    add_noise: bool = True # Flag to turn noise on/off
 
 @dataclass
 class Electrostatics:
     """Parameters for the electrostatic environment."""
-    sigma_e: float = 1.0     # Electrolyte conductivity, S/m
+    sigma_e: float = 1.0   # Electrolyte conductivity, S/m
     V_applied: float = 0.5   # Applied voltage across the box, V
 
 @dataclass
@@ -256,10 +263,8 @@ class ImplicitVMSolver:
     """Solver for the semi-implicit update of the 2D transmembrane potential Vm."""
     def __init__(self, dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, Lz):
         self.Nx, self.Ny = dom.Nx, dom.Ny
-        # print("Building and factorizing the implicit Vm operator... ", end="")
         A = build_vm_implicit_operator(dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, Lz)
         self.solver = factorized(A)
-        # print("Done.")
         
     def solve(self, b_flat):
         """Solves the system Ax = b using the pre-factorized operator."""
@@ -267,10 +272,14 @@ class ImplicitVMSolver:
         return x_flat.reshape((self.Nx, self.Ny), order='C')
 
 class PhaseFieldSolver:
-    """Solver for the Cahn-Hilliard evolution of the phase field `psi`."""
-    def __init__(self, dom: Domain, phase_params: PhaseFieldParams, dx: float, dt: float):
+    """Solver for the stochastic Allen-Cahn evolution of the phase field `psi`."""
+    def __init__(self, dom: Domain, phase_params: PhaseFieldParams, thermal_params: ThermalParams, dx: float, dt: float):
         self.params = phase_params
+        self.thermal = thermal_params
         self.Cg = np.sqrt(2.0) / 12.0
+        self.dx = dx
+        self.dt = dt
+        self.dom = dom
         
         # Spectral (FFT) setup
         kx = 2.0 * np.pi * np.fft.fftfreq(dom.Nx, d=dx)
@@ -279,7 +288,14 @@ class PhaseFieldSolver:
         self.K2 = KX**2 + KY**2
         
         # Denominator for semi-implicit time stepping
-        self.denom = 1.0 + dt * self.params.mobility * (self.params.line_tension / self.Cg) * self.params.transition_thickness * self.K2
+        self.denom = 1.0 + self.dt * self.params.mobility * (self.params.line_tension / self.Cg) * self.params.transition_thickness * self.K2
+        
+        # Pre-calculate noise amplitude for efficiency based on fluctuation-dissipation theorem
+        if self.thermal.add_noise:
+            noise_variance = (2 * self.params.mobility * self.thermal.k_B * self.thermal.T) / (self.dx * self.dx * self.dt)
+            self.noise_amplitude = np.sqrt(noise_variance)
+        else:
+            self.noise_amplitude = 0.0
 
     @staticmethod
     @numba.njit(cache=True)
@@ -292,18 +308,25 @@ class PhaseFieldSolver:
         psi_clipped = np.clip(psi, 0.0, 1.0)
         return 6.0 * psi_clipped * (1.0 - psi_clipped)
 
-    def evolve(self, psi, dt):
+    def evolve(self, psi, sigma_map: np.ndarray):
         """Advance the phase field by one time step `dt`."""
         # Explicit part of the equation (reaction terms)
-        rhs = -self.params.mobility * (
+        deterministic_rhs = -self.params.mobility * (
             (self.params.line_tension / self.Cg) * (self._g_prime(psi) / self.params.transition_thickness) +
-            self.params.sigma_area * self._dH_prime(psi)
+            sigma_map * self._dH_prime(psi)
         )
+        
+        # Add stochastic thermal noise if enabled
+        if self.thermal.add_noise:
+            noise = self.noise_amplitude * np.random.randn(self.dom.Nx, self.dom.Ny)
+            rhs = deterministic_rhs + noise
+        else:
+            rhs = deterministic_rhs
         
         # Advance one step in Fourier space
         psi_hat = np.fft.fft2(psi)
         rhs_hat = np.fft.fft2(rhs)
-        psi_hat_new = (psi_hat + dt * rhs_hat) / self.denom
+        psi_hat_new = (psi_hat + self.dt * rhs_hat) / self.denom
         
         # Transform back to real space and clip for stability
         psi_new = np.fft.ifft2(psi_hat_new).real
@@ -321,14 +344,22 @@ def create_grid(dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float,
 
 def smooth_step(psi: np.ndarray) -> np.ndarray:
     """Computes a cubic Hermite smooth step function H(psi)."""
-    return psi**2 * (3.0 - 2.0 * psi)
+    psi_clipped = np.clip(psi, 0.0, 1.0)
+    return psi_clipped**2 * (3.0 - 2.0 * psi_clipped)
 
-def build_initial_phase_field(x: np.ndarray, y: np.ndarray, pore_radius: float, ell: float) -> np.ndarray:
-    """Constructs the initial phase field `psi`."""
+def build_initial_pore(x: np.ndarray, y: np.ndarray, pore_radius: float, ell: float) -> np.ndarray:
+    """Constructs the initial phase field `psi` with a pre-defined pore."""
     xx, yy = np.meshgrid(x, y, indexing="ij")
     r = np.sqrt(xx**2 + yy**2)
     psi = 0.5 * (1.0 + np.tanh((r - pore_radius) / (np.sqrt(2.0) * ell)))
     return psi
+
+def build_initial_intact_membrane(dom: Domain, noise_amplitude: float = 1e-4) -> np.ndarray:
+    """Constructs the initial phase field for an intact membrane with small perturbations."""
+    psi = np.ones((dom.Nx, dom.Ny), dtype=float)
+    rng = np.random.default_rng()
+    psi -= noise_amplitude * rng.random((dom.Nx, dom.Ny))
+    return np.clip(psi, 0.0, 1.0)
 
 def blend_properties(H: np.ndarray, props: MembraneProps, dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Blends material properties based on the phase field."""
@@ -348,11 +379,39 @@ def estimate_base_time_step(props: MembraneProps, elec: Electrostatics, dom: Dom
     tau_local_min = 1.0 / rate_max
     dt_base = solver.dt_safety * tau_local_min
     
-    # Estimate system time constant for total simulation time
     tau_report = props.C_lipid / (1.0 / props.R_lipid + A)
     total_time = solver.n_tau_total * tau_report
     nsteps_base = int(np.ceil(total_time / dt_base))
     return dt_base, total_time, nsteps_base
+
+## MODIFICATION: New function to robustly calculate pore radius
+def calculate_pore_radius_robust(psi: np.ndarray, dx: float, threshold: float = 0.5) -> float:
+    """
+    Calculates the effective radius of the largest pore.
+
+    This function identifies all disconnected "pore" regions where psi < threshold,
+    calculates the area of the largest region, and returns its effective radius.
+    This is robust against background thermal noise.
+    """
+    is_pore = psi < threshold
+    if not np.any(is_pore):
+        return 0.0
+
+    # Label connected regions of the pore phase
+    labeled_array, num_features = label(is_pore)
+    if num_features == 0:
+        return 0.0
+
+    # Find the size of the largest connected component (pore)
+    # Note: label 0 is the background (non-pore)
+    component_sizes = np.bincount(labeled_array.ravel())[1:]
+    largest_component_size = np.max(component_sizes)
+    
+    # Calculate area and effective radius
+    pore_area = largest_component_size * (dx * dx)
+    eff_radius = np.sqrt(pore_area / np.pi)
+    
+    return eff_radius
 
 # -----------------------------------------------------------------------------
 # Visualization and Main Driver
@@ -366,28 +425,25 @@ def plot_results(x, y, z, Vm, phi_elec, psi, time_points, avg_Vm_vs_time, pore_r
 
     fig.suptitle(f"{title_prefix}\n(Total Wall Clock Time: {elapsed_time:.2f} s)", fontsize=16, y=1.05)
 
-    # Plot 1: Average Vm vs Time
     ax1 = fig.add_subplot(1, 4, 1)
-    ax1.plot(time_ns, avg_Vm_vs_time, marker="o", linestyle="-", label="Avg Vm")
+    ax1.plot(time_ns, avg_Vm_vs_time, marker=".", linestyle="-", label="Avg Vm")
     ax1.set_xlabel("Time (ns)"); ax1.set_ylabel("Average Vm (V)")
     ax1.set_title("Membrane Charging"); ax1.grid(True, linestyle='--')
     
-    # Plot 2: Pore Radius vs Time
     ax2 = fig.add_subplot(1, 4, 2)
-    ax2.plot(time_ns, np.array(pore_radius_vs_time) * 1e9, marker='o', linestyle='-', color='crimson')
+    ax2.plot(time_ns, np.array(pore_radius_vs_time) * 1e9, marker='.', linestyle='-', color='crimson')
     ax2.set_xlabel("Time (ns)"); ax2.set_ylabel("Effective Pore Radius (nm)")
     ax2.set_title("Pore Dynamics"); ax2.grid(True, linestyle='--')
+    ax2.set_ylim(bottom=0)
 
-    # Plot 3: Final Vm Distribution
     ax3 = fig.add_subplot(1, 4, 3)
     im3 = ax3.imshow(Vm.T, origin="lower", extent=[x_nm[0], x_nm[-1], y_nm[0], y_nm[-1]], cmap="magma")
     ax3.set_xlabel("x (nm)"); ax3.set_ylabel("y (nm)"); ax3.set_title("Final $V_m$ Distribution")
     cax3 = make_axes_locatable(ax3).append_axes("right", size="5%", pad=0.1)
     fig.colorbar(im3, cax=cax3, label="Voltage (V)")
 
-    # Plot 4: Final Phase Field
     ax4 = fig.add_subplot(1, 4, 4)
-    im4 = ax4.imshow(psi.T, origin="lower", extent=[x_nm[0], x_nm[-1], y_nm[0], y_nm[-1]], cmap="cividis")
+    im4 = ax4.imshow(psi.T, origin="lower", extent=[x_nm[0], x_nm[-1], y_nm[0], y_nm[-1]], cmap="cividis", vmin=0, vmax=1)
     ax4.set_xlabel("x (nm)"); ax4.set_ylabel("y (nm)"); ax4.set_title("Final Pore Shape ($\\psi$)")
     cax4 = make_axes_locatable(ax4).append_axes("right", size="5%", pad=0.1)
     fig.colorbar(im4, cax=cax4, label="Phase Field")
@@ -397,8 +453,8 @@ def plot_results(x, y, z, Vm, phi_elec, psi, time_points, avg_Vm_vs_time, pore_r
 
 def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProps | None = None,
                                phase: PhaseFieldParams | None = None, elec: Electrostatics | None = None,
-                               solver: SolverParams | None = None) -> None:
-    """Main driver for the membrane charging simulation."""
+                               solver: SolverParams | None = None, thermal: ThermalParams | None = None) -> None:
+    """Main driver for the membrane charging and nucleation simulation."""
     # --- 1. Initialization ---
     start_time = time.time()
     dom = dom_in if dom_in is not None else Domain()
@@ -406,6 +462,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     phase = phase if phase is not None else PhaseFieldParams()
     elec = elec if elec is not None else Electrostatics()
     solver = solver if solver is not None else SolverParams()
+    thermal = thermal if thermal is not None else ThermalParams()
 
     x, y, z, dx, dy, dz = create_grid(dom)
     if phase.transition_thickness is None:
@@ -419,7 +476,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     if solver.surface_diffusion and solver.D_V == 0.0:
         solver.D_V = 0.05 * dx**2 / dt
 
-    title_prefix = "Coupled Electrostatics & Phase-Field Dynamics"
+    title_prefix = "Coupled Electrostatics & Phase-Field Nucleation"
     print(f"\n--- {title_prefix} ---")
     print(f"Grid: {dom.Nx}x{dom.Ny}x{dom.Nz} (dx={dx*1e9:.2f} nm)")
     tau_report = total_time / solver.n_tau_total
@@ -428,12 +485,14 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     print(f"Implicit dt: {dt*1e9:.3f} ns | Base dt would be: {dt_base*1e9:.3f} ns")
     print(f"Total steps: {nsteps} (vs {nsteps_base} for explicit Vm)")
     print(f"Vm solver will be rebuilt every {solver.rebuild_vm_solver_every} steps.")
+    print(f"Thermal noise enabled: {thermal.add_noise} at T = {thermal.T} K")
     
     # --- Initialize Solvers ---
-    psi = build_initial_phase_field(x, y, phase.pore_radius, phase.transition_thickness)
+    psi = build_initial_intact_membrane(dom)
+    
     phi_elec_solver = AMGPoissonSolver(dom, dx, dy, dz)
-    phase_field_solver = PhaseFieldSolver(dom, phase, dx, dt)
-    vm_implicit_solver = None # Will be built inside the loop
+    phase_field_solver = PhaseFieldSolver(dom, phase, thermal, dx, dt)
+    vm_implicit_solver = None
     
     print("-" * 60)
 
@@ -443,31 +502,31 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     save_interval = max(1, nsteps // solver.save_frames)
 
     for n in range(nsteps):
-        # --- Evolve Phase Field ---
-        psi = phase_field_solver.evolve(psi, dt)
         H = smooth_step(psi)
+        G_m_map, C_m_map, C_eff_map = blend_properties(H, props, dom)
 
-        # --- Rebuild Vm Solver Periodically ---
         if n % solver.rebuild_vm_solver_every == 0:
             if n > 0: print(f"Step {n}: Rebuilding Vm implicit solver...")
-            G_m_map, _, C_eff_map = blend_properties(H, props, dom)
             vm_implicit_solver = ImplicitVMSolver(
                 dom, C_eff_map, G_m_map, H, dt, dx, solver.D_V, elec.sigma_e, dom.Lz
             )
 
-        # --- Evolve Electrostatics ---
         phi_elec = phi_elec_solver.solve(Vm, elec.V_applied)
         J_elec_coupled = calculate_J_from_phi(phi_elec, phi_elec_solver.k_mem_plus, elec.sigma_e, dz)
         b_rhs_2d = C_eff_map * Vm + dt * J_elec_coupled
         Vm = vm_implicit_solver.solve(b_rhs_2d.flatten(order='C'))
 
-        # --- Save Data ---
+        # --- Evolve Phase Field (with feedback from Vm and thermal noise) ---
+        sigma_elec = 0.5 * C_m_map * (Vm**2)
+        sigma_total_map = phase.sigma_area + sigma_elec
+        psi = phase_field_solver.evolve(psi, sigma_total_map)
+
         if n % save_interval == 0 or n == nsteps - 1:
             t = (n + 1) * dt
             avg_Vm = float(np.mean(Vm))
             
-            pore_area = np.sum(1.0 - H) * dx * dx
-            eff_radius = np.sqrt(max(pore_area, 0.0) / np.pi)
+            ## MODIFICATION: Call the new robust function to measure pore radius
+            eff_radius = calculate_pore_radius_robust(psi, dx, threshold=0.5)
 
             time_points.append(t)
             avg_Vm_vs_time.append(avg_Vm)
@@ -482,32 +541,45 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     
     plot_results(x, y, z, Vm, phi_elec, psi, time_points, avg_Vm_vs_time, pore_radius_vs_time, title_prefix, elapsed_time)
 
-    # --- Save results to a file ---
-    filename = "membrane_dynamics_coupled.npz"
+    filename = "membrane_nucleation_coupled.npz"
+    H = smooth_step(psi)
     np.savez_compressed(
-        filename, 
-        x=x, y=y, z=z, 
-        Vm=Vm, phi_elec=phi_elec, psi=psi, H=H,
-        time_points=np.array(time_points),
-        avg_Vm_vs_time=np.array(avg_Vm_vs_time),
-        pore_radius_vs_time=np.array(pore_radius_vs_time),
-        domain_params=dom, props_params=props, phase_params=phase,
-        elec_params=elec, solver_params=solver
+        filename, x=x, y=y, z=z, Vm=Vm, phi_elec=phi_elec, psi=psi, H=H,
+        time_points=np.array(time_points), avg_Vm_vs_time=np.array(avg_Vm_vs_time),
+        pore_radius_vs_time=np.array(pore_radius_vs_time), domain_params=dom,
+        props_params=props, phase_params=phase, elec_params=elec, solver_params=solver,
+        thermal_params=thermal
     )
     print(f"Numerical results saved to {filename}")
     
 if __name__ == "__main__":
-    custom_domain = Domain(Nx=128, Ny=128, Nz=129)
+    ## MODIFICATION: Domain size updated to match your specified dimensions
+    # 100nm x 100nm membrane patch in a 2 micron deep electrolyte box
+    custom_domain = Domain(Lx=50e-9, Ly=50e-9, Lz=2000e-9, Nx=128, Ny=128, Nz=129)
+    
     fast_solver = SolverParams(
-        save_frames=40, 
-        implicit_dt_multiplier=50.0, # Reduced multiplier as phase dynamics can be fast
-        rebuild_vm_solver_every=25
+        save_frames=80, 
+        implicit_dt_multiplier=50.0,
+        rebuild_vm_solver_every=25,
+        n_tau_total=50.0 
     )
-    # Start with a smaller initial pore to see dynamics
-    dynamic_phase = PhaseFieldParams(pore_radius=500e-9, mobility=5.0e8)
+    
+    nucleation_phase_params = PhaseFieldParams(
+        mobility=5.0e4,
+        sigma_area=2e-3 
+    )
+    
+    # NOTE: With the smaller Lz, the electric field E = V/Lz is much stronger.
+    # A lower V_applied might be needed to see delayed nucleation.
+    # Let's start with a slightly lower voltage.
+    high_voltage = Electrostatics(V_applied=1.1)
+    
+    thermal_params = ThermalParams(T=310.0, add_noise=True)
 
     simulate_membrane_charging(
         dom_in=custom_domain, 
         solver=fast_solver,
-        phase=dynamic_phase
+        phase=nucleation_phase_params,
+        elec=high_voltage,
+        thermal=thermal_params
     )

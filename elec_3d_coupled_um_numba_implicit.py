@@ -285,7 +285,7 @@ def blend_properties(H: np.ndarray, props: MembraneProps, dom: Domain) -> Tuple[
     G_lipid, G_pore = 1.0 / props.R_lipid, 1.0 / props.R_pore
     G_m_map = G_pore + (G_lipid - G_pore) * H
     C_m_map = props.C_pore + (props.C_lipid - props.C_pore) * H
-    C_bath = 2.0 * EPS_W / dom.Lz
+    C_bath = 0 # 2.0 * EPS_W / dom.Lz
     C_eff_map = C_bath + C_m_map
     return G_m_map, C_m_map, C_eff_map
 
