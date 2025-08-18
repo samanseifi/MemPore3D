@@ -566,15 +566,15 @@ if __name__ == "__main__":
     
     nucleation_phase_params = PhaseFieldParams(
         mobility=5.0e4,
-        sigma_area=2e-3 
+        sigma_area=5e-3 
     )
     
     # NOTE: With the smaller Lz, the electric field E = V/Lz is much stronger.
     # A lower V_applied might be needed to see delayed nucleation.
     # Let's start with a slightly lower voltage.
-    high_voltage = Electrostatics(V_applied=1.1)
+    high_voltage = Electrostatics(V_applied=1.2)
     
-    thermal_params = ThermalParams(T=310.0, add_noise=True)
+    thermal_params = ThermalParams(T=200.0, add_noise=True)
 
     simulate_membrane_charging(
         dom_in=custom_domain, 
