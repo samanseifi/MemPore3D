@@ -75,7 +75,7 @@ class MembraneProps:
 class PhaseFieldParams:
     """Parameters for the phase-field model of the pore."""
     # --- Initial State ---
-    pore_radius: float = 500e-9 # Used only if not starting from intact patch
+    pore_radius: float = 2e-9 # Used only if not starting from intact patch
     transition_thickness: float | None = None  # If None, defaults to 0.5*dx
     # --- Dynamics ---
     line_tension: float = 1.5e-11 # J/m, aka 'gamma'
@@ -309,28 +309,37 @@ class PhaseFieldSolver:
         return 6.0 * psi_clipped * (1.0 - psi_clipped)
 
     def evolve(self, psi, sigma_map: np.ndarray):
-        """Advance the phase field by one time step `dt`."""
-        # Explicit part of the equation (reaction terms)
-        deterministic_rhs = -self.params.mobility * (
-            (self.params.line_tension / self.Cg) * (self._g_prime(psi) / self.params.transition_thickness) +
-            sigma_map * self._dH_prime(psi)
-        )
-        
-        # Add stochastic thermal noise if enabled
-        if self.thermal.add_noise:
-            noise = self.noise_amplitude * np.random.randn(self.dom.Nx, self.dom.Ny)
-            rhs = deterministic_rhs + noise
-        else:
-            rhs = deterministic_rhs
-        
-        # Advance one step in Fourier space
-        psi_hat = np.fft.fft2(psi)
-        rhs_hat = np.fft.fft2(rhs)
-        psi_hat_new = (psi_hat + self.dt * rhs_hat) / self.denom
-        
-        # Transform back to real space and clip for stability
-        psi_new = np.fft.ifft2(psi_hat_new).real
-        return np.clip(psi_new, 0.0, 1.0)
+            """Advance the phase field by one time step `dt`."""
+            # Explicit part of the equation (reaction terms)
+            deterministic_rhs = -self.params.mobility * (
+                (self.params.line_tension / self.Cg) * (self._g_prime(psi) / self.params.transition_thickness) +
+                sigma_map * self._dH_prime(psi)
+            )
+            
+            # Add stochastic thermal noise if enabled
+            if self.thermal.add_noise:
+                # --- FIX: USE STATE-DEPENDENT (MULTIPLICATIVE) NOISE ---
+                # The noise strength is modulated by sqrt(psi*(1-psi)) to ensure it
+                # vanishes at the pure-state boundaries (psi=0 and psi=1).
+                # This prevents the numerical drift artifact at psi=1.
+                # We add a small epsilon to avoid taking the sqrt of a negative number due to float precision.
+                psi_clipped = np.clip(psi, 1e-9, 1.0 - 1e-9)
+                noise_modulator = np.sqrt(psi_clipped * (1.0 - psi_clipped))
+                
+                noise = self.noise_amplitude * noise_modulator * np.random.randn(self.dom.Nx, self.dom.Ny)
+                rhs = deterministic_rhs + noise
+            else:
+                rhs = deterministic_rhs
+            
+            # Advance one step in Fourier space
+            # ... (the rest of the function remains the same) ...
+            psi_hat = np.fft.fft2(psi)
+            rhs_hat = np.fft.fft2(rhs)
+            psi_hat_new = (psi_hat + self.dt * rhs_hat) / self.denom
+            
+            # Transform back to real space and clip for stability
+            psi_new = np.fft.ifft2(psi_hat_new).real
+            return np.clip(psi_new, 0.0, 1.0)
 
 
 def create_grid(dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
@@ -366,6 +375,25 @@ def blend_properties(H: np.ndarray, props: MembraneProps, dom: Domain) -> Tuple[
     G_lipid, G_pore = 1.0 / props.R_lipid, 1.0 / props.R_pore
     G_m_map = G_pore + (G_lipid - G_pore) * H
     C_m_map = props.C_pore + (props.C_lipid - props.C_pore) * H
+    C_bath = 2.0 * EPS_W / dom.Lz
+    C_eff_map = C_bath + C_m_map
+    return G_m_map, C_m_map, C_eff_map
+
+def blend_properties_sharp(psi: np.ndarray, props: MembraneProps, dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Blends material properties based on a sharp threshold of the phase field.
+    This prevents background leakage from thermal noise in the lipid phase.
+    """
+    # Create a binary mask: 1.0 for lipid, 0.0 for pore
+    is_lipid_mask = (psi > 0.5).astype(float)
+
+    G_lipid, G_pore = 1.0 / props.R_lipid, 1.0 / props.R_pore
+    C_lipid, C_pore = props.C_lipid, props.C_pore
+
+    # Use the mask to assign pure properties. No blending.
+    G_m_map = G_pore + (G_lipid - G_pore) * is_lipid_mask
+    C_m_map = C_pore + (C_lipid - C_pore) * is_lipid_mask
+
     C_bath = 2.0 * EPS_W / dom.Lz
     C_eff_map = C_bath + C_m_map
     return G_m_map, C_m_map, C_eff_map
@@ -466,7 +494,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
 
     x, y, z, dx, dy, dz = create_grid(dom)
     if phase.transition_thickness is None:
-        phase.transition_thickness = 0.5 * dx
+        phase.transition_thickness = 1.5 * dx
     
     # --- 2. Build Model & Configure Solvers ---
     dt_base, total_time, nsteps_base = estimate_base_time_step(props, elec, dom, solver)
@@ -489,6 +517,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     
     # --- Initialize Solvers ---
     psi = build_initial_intact_membrane(dom)
+    # psi = build_initial_pore(x, y, phase.pore_radius, phase.transition_thickness)
     
     phi_elec_solver = AMGPoissonSolver(dom, dx, dy, dz)
     phase_field_solver = PhaseFieldSolver(dom, phase, thermal, dx, dt)
@@ -502,8 +531,10 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     save_interval = max(1, nsteps // solver.save_frames)
 
     for n in range(nsteps):
+        # H = smooth_step(psi)
+        # G_m_map, C_m_map, C_eff_map = blend_properties(H, props, dom)
+        G_m_map, C_m_map, C_eff_map = blend_properties_sharp(psi, props, dom)
         H = smooth_step(psi)
-        G_m_map, C_m_map, C_eff_map = blend_properties(H, props, dom)
 
         if n % solver.rebuild_vm_solver_every == 0:
             if n > 0: print(f"Step {n}: Rebuilding Vm implicit solver...")
@@ -526,7 +557,9 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
             avg_Vm = float(np.mean(Vm))
             
             ## MODIFICATION: Call the new robust function to measure pore radius
-            eff_radius = calculate_pore_radius_robust(psi, dx, threshold=0.5)
+            # eff_radius = calculate_pore_radius_robust(psi, dx, threshold=0.5)
+            Apore = np.sum(1.0 - H) * dx * dy
+            eff_radius = np.sqrt(max(Apore, 0.0) / np.pi)
 
             time_points.append(t)
             avg_Vm_vs_time.append(avg_Vm)
@@ -553,33 +586,50 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     print(f"Numerical results saved to {filename}")
     
 if __name__ == "__main__":
-    ## MODIFICATION: Domain size updated to match your specified dimensions
-    # 100nm x 100nm membrane patch in a 2 micron deep electrolyte box
-    custom_domain = Domain(Lx=50e-9, Ly=50e-9, Lz=2000e-9, Nx=128, Ny=128, Nz=129)
-    
-    fast_solver = SolverParams(
-        save_frames=80, 
-        implicit_dt_multiplier=50.0,
-        rebuild_vm_solver_every=25,
-        n_tau_total=50.0 
-    )
-    
-    nucleation_phase_params = PhaseFieldParams(
-        mobility=5.0e4,
-        sigma_area=5e-3 
-    )
-    
-    # NOTE: With the smaller Lz, the electric field E = V/Lz is much stronger.
-    # A lower V_applied might be needed to see delayed nucleation.
-    # Let's start with a slightly lower voltage.
-    high_voltage = Electrostatics(V_applied=1.2)
-    
-    thermal_params = ThermalParams(T=200.0, add_noise=True)
+    # A 500nm x 500nm patch is a good size to see the pore grow.
+    custom_domain = Domain(Lx=100e-9, Ly=100e-9, Lz=200e-9, Nx=128, Ny=128, Nz=129)
 
+    # Use solver settings appropriate for a dynamic, coupled simulation.
+    # We need a reasonable dt and periodic rebuilding of the Vm solver.
+    solver_params = SolverParams(
+        save_frames=80,
+        implicit_dt_multiplier=10.0, # A reasonable value for stability and speed.
+        rebuild_vm_solver_every=50,    # Rebuild as the pore shape changes.
+        n_tau_total=800.0                # Simulate for 8x the membrane charging time.
+    )
+
+    # --- KEY PARAMETERS FOR PORE GROWTH ---
+    pore_growth_params = PhaseFieldParams(
+        # 1. Start with a well-resolved pore. dx is ~3.9nm, so 20nm is > 5*dx.
+        # This prevents the "numerical pinning" issue.
+        pore_radius=10e-9,
+
+        # 2. Set mechanical surface tension to zero. This means that without
+        # voltage, this pore would be guaranteed to close.
+        sigma_area=0.0,
+        
+        # Use standard values for other parameters.
+        mobility=5.0e6,
+        line_tension=1.5e-11
+    )
+
+    # 3. Apply a voltage strong enough to overcome line tension.
+    # A Vm of ~0.4-0.5V is needed, so V_applied=1.0V is a good choice.
+    high_voltage = Electrostatics(V_applied=20.0)
+
+    # Turn off thermal noise to see a clean, deterministic growth pattern.
+    thermal_params = ThermalParams(T=300, add_noise=True)
+
+    # Set a descriptive title for the plot.
+    # Note: This line requires a small change in the main function to work,
+    # or you can just modify the string directly in plot_results.
+    title_prefix = "Voltage-Driven Pore Expansion"
+    
+    print("--- Starting Simulation: Voltage-Driven Pore Expansion ---")
     simulate_membrane_charging(
-        dom_in=custom_domain, 
-        solver=fast_solver,
-        phase=nucleation_phase_params,
+        dom_in=custom_domain,
+        solver=solver_params,
+        phase=pore_growth_params,
         elec=high_voltage,
         thermal=thermal_params
     )
