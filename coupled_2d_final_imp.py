@@ -256,7 +256,7 @@ class AMGPoissonSolver:
         rhs = np.zeros(self.N, dtype=np.float64)
         _build_rhs_numba(rhs, Vm, self.dom.Nx, self.dom.Ny, self.shape[2],
                          self.k_mem_minus, self.k_mem_plus, V_applied)
-        phi_flat = self.ml.solve(rhs, tol=1e-8, maxiter=5)
+        phi_flat = self.ml.solve(rhs, tol=1e-8, maxiter=20)
         return phi_flat.reshape(self.shape, order="F")
 
 class ImplicitVMSolver:
@@ -323,10 +323,11 @@ class PhaseFieldSolver:
                 # vanishes at the pure-state boundaries (psi=0 and psi=1).
                 # This prevents the numerical drift artifact at psi=1.
                 # We add a small epsilon to avoid taking the sqrt of a negative number due to float precision.
-                psi_clipped = np.clip(psi, 1e-9, 1.0 - 1e-9)
-                noise_modulator = np.sqrt(psi_clipped * (1.0 - psi_clipped))
+                # psi_clipped = np.clip(psi, 1e-9, 1.0 - 1e-9)
+                # noise_modulator = np.sqrt(psi_clipped * (1.0 - psi_clipped))
                 
-                noise = self.noise_amplitude * noise_modulator * np.random.randn(self.dom.Nx, self.dom.Ny)
+                # noise = self.noise_amplitude * noise_modulator * np.random.randn(self.dom.Nx, self.dom.Ny)
+                noise = self.noise_amplitude * np.random.randn(self.dom.Nx, self.dom.Ny)
                 rhs = deterministic_rhs + noise
             else:
                 rhs = deterministic_rhs
@@ -587,15 +588,15 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     
 if __name__ == "__main__":
     # A 500nm x 500nm patch is a good size to see the pore grow.
-    custom_domain = Domain(Lx=100e-9, Ly=100e-9, Lz=200e-9, Nx=128, Ny=128, Nz=129)
+    custom_domain = Domain(Lx=50e-9, Ly=50e-9, Lz=200e-9, Nx=128, Ny=128, Nz=129)
 
     # Use solver settings appropriate for a dynamic, coupled simulation.
     # We need a reasonable dt and periodic rebuilding of the Vm solver.
     solver_params = SolverParams(
         save_frames=80,
         implicit_dt_multiplier=10.0, # A reasonable value for stability and speed.
-        rebuild_vm_solver_every=50,    # Rebuild as the pore shape changes.
-        n_tau_total=800.0                # Simulate for 8x the membrane charging time.
+        rebuild_vm_solver_every=25,    # Rebuild as the pore shape changes.
+        n_tau_total=500.0                # Simulate for 8x the membrane charging time.
     )
 
     # --- KEY PARAMETERS FOR PORE GROWTH ---
@@ -603,19 +604,21 @@ if __name__ == "__main__":
         # 1. Start with a well-resolved pore. dx is ~3.9nm, so 20nm is > 5*dx.
         # This prevents the "numerical pinning" issue.
         pore_radius=10e-9,
+        
+        transition_thickness=3e-9,  # Explicitly set thicker interface
 
         # 2. Set mechanical surface tension to zero. This means that without
         # voltage, this pore would be guaranteed to close.
         sigma_area=0.0,
         
         # Use standard values for other parameters.
-        mobility=5.0e6,
+        mobility=5.0e4,
         line_tension=1.5e-11
     )
 
     # 3. Apply a voltage strong enough to overcome line tension.
     # A Vm of ~0.4-0.5V is needed, so V_applied=1.0V is a good choice.
-    high_voltage = Electrostatics(V_applied=20.0)
+    high_voltage = Electrostatics(V_applied=10.0)
 
     # Turn off thermal noise to see a clean, deterministic growth pattern.
     thermal_params = ThermalParams(T=300, add_noise=True)

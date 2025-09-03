@@ -1,0 +1,14 @@
+{
+    "L_tilde": 1000.0,
+    "N": 5000,
+    "epsilon": 1.0,
+    "sigma_initial": 0.0,
+    "sigma_final": -1.5,
+    "noise_strength": 0.001,
+    "kappa": 0.01,
+    "K_A": 0.1,
+    "phi0": 1.0,
+    "t_total": 1.0,
+    "T_steps": 5000,
+    "save_interval": 100
+}
