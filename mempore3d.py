@@ -82,6 +82,7 @@ class PhaseFieldParams:
     line_tension: float = 1.5e-11 # J/m, aka 'gamma'
     mobility: float = 5000.0      # m^2/(J*s), aka 'M'
     sigma_area: float = 0.0       # J/m^2, base membrane tension (sigma_0)
+    evolve: str = 'on'          # 'on' to evolve, 'off' for static pore
 
 @dataclass
 class ThermalParams:
@@ -459,6 +460,11 @@ def calculate_pore_radius_robust(psi: np.ndarray, dx: float, threshold: float = 
     
     return eff_radius
 
+def calculate_pore_radius_simple(H: np.ndarray, dx: float, dy: float) -> float:
+    pore_area = np.sum(1.0 - H) * dx * dy
+    eff_radius = np.sqrt(max(pore_area, 0.0) / np.pi)
+    return eff_radius
+
 # -----------------------------------------------------------------------------
 # Visualization and Main Driver
 # -----------------------------------------------------------------------------
@@ -502,23 +508,25 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     """
     Main driver for the membrane charging and nucleation simulation.
     If `elec` is None, runs a pure phase-field simulation without electrostatics.
+    If `phase` is None, runs a pure electrostatics simulation on a static, intact membrane.
     If `thermal` is None, thermal noise is disabled.
     """
     # --- 1. Initialization ---
     start_time = time.time()
     dom = dom_in if dom_in is not None else Domain()
     props = props if props is not None else MembraneProps()
-    phase = phase if phase is not None else PhaseFieldParams()
     solver = solver if solver is not None else SolverParams()
+
+    # Determine simulation modes based on provided parameters
+    phase_field_on = phase.evolve == 'on'
+    electrostatics_on = elec is not None
 
     # If thermal params are not provided, disable noise.
     if thermal is None:
         thermal = ThermalParams(add_noise=False)
 
-    # Determine if electrostatics are active
-    electrostatics_on = elec is not None
+    # If no electrostatics, create a default object with zero applied voltage
     if not electrostatics_on:
-        # If no electrostatics, create a default object with zero applied voltage
         elec = Electrostatics(V_applied=0.0)
 
     x, y, z, dx, dy, dz = create_grid(dom)
@@ -533,7 +541,17 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     if solver.surface_diffusion and solver.D_V == 0.0:
         solver.D_V = 0.05 * dx**2 / dt
 
-    title_prefix = "Coupled Electrostatics & Phase-Field" if electrostatics_on else "Pure Phase-Field Simulation"
+    # --- Setup Title and Print Info ---
+    if electrostatics_on and phase_field_on:
+        title_prefix = "Coupled Electrostatics & Phase-Field"
+    elif electrostatics_on:
+        title_prefix = "Pure Electrostatics Simulation (Static Membrane)"
+    elif phase_field_on:
+        title_prefix = "Pure Phase-Field Simulation"
+    else:
+        title_prefix = "Static Simulation (No Dynamics)"
+        nsteps = 1 # No dynamics, just run one step to get initial state
+
     print(f"\n--- {title_prefix} ---")
     print(f"Grid: {dom.Nx}x{dom.Ny}x{dom.Nz} (dx={dx*1e9:.2f} nm)")
     tau_report = total_time / solver.n_tau_total
@@ -542,11 +560,13 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     print(f"Time step (dt): {dt*1e9:.3f} ns | Total steps: {nsteps}")
     if electrostatics_on:
         print(f"Vm solver will be rebuilt every {solver.rebuild_vm_solver_every} steps.")
-    print(f"Thermal noise enabled: {thermal.add_noise} at T = {thermal.T} K")
+    print(f"Phase-field evolution enabled: {phase_field_on}")
+    if phase_field_on:
+        print(f"Thermal noise enabled: {thermal.add_noise} at T = {thermal.T} K")
 
     # --- Initialize Solvers ---
     psi = initialize_phase_field(phase, x, y)
-    phase_field_solver = PhaseFieldSolver(dom, phase, thermal, dx, dt)
+    phase_field_solver = PhaseFieldSolver(dom, phase, thermal, dx, dt) if phase_field_on else None
     phi_elec_solver = AMGPoissonSolver(dom, dx, dy, dz) if electrostatics_on else None
     vm_implicit_solver = None
 
@@ -558,15 +578,20 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     save_interval = max(1, nsteps // solver.save_frames)
 
     for n in range(nsteps):
-        H = smooth_step(psi)
-        G_m_map, C_m_map, C_eff_map = blend_properties(H, props, dom)
+        # Use sharp properties if noise is on to prevent leakage, otherwise smooth
+        if thermal.add_noise:
+            G_m_map, C_m_map, C_eff_map = blend_properties_sharp(psi, props, dom)
+        else:
+            H = smooth_step(psi)
+            G_m_map, C_m_map, C_eff_map = blend_properties(H, props, dom)
 
         sigma_elec = 0.0
         if electrostatics_on:
-            if n % solver.rebuild_vm_solver_every == 0:
+            if n % solver.rebuild_vm_solver_every == 0 or vm_implicit_solver is None:
                 if n > 0: print(f"Step {n}: Rebuilding Vm implicit solver...")
+                H_for_solver = (psi > 0.5).astype(float) if thermal.add_noise else smooth_step(psi)
                 vm_implicit_solver = ImplicitVMSolver(
-                    dom, C_eff_map, G_m_map, H, dt, dx, solver.D_V, elec.sigma_e, dom.Lz
+                    dom, C_eff_map, G_m_map, H_for_solver, dt, dx, solver.D_V, elec.sigma_e, dom.Lz
                 )
 
             phi_elec = phi_elec_solver.solve(Vm, elec.V_applied)
@@ -575,17 +600,17 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
             Vm = vm_implicit_solver.solve(b_rhs_2d.flatten(order='C'))
             sigma_elec = 0.5 * C_m_map * (Vm**2)
 
-        # --- Evolve Phase Field (with feedback from Vm and thermal noise) ---
-        sigma_total_map = phase.sigma_area + sigma_elec
-        psi = phase_field_solver.evolve(psi, sigma_total_map)
-
+        # --- Evolve Phase Field (if enabled) ---
+        if phase_field_on:
+            sigma_total_map = phase.sigma_area + sigma_elec
+            psi = phase_field_solver.evolve(psi, sigma_total_map)
+        
         if n % save_interval == 0 or n == nsteps - 1:
             t = (n + 1) * dt
-            avg_Vm = float(np.mean(Vm))
-            # eff_radius = calculate_pore_radius_robust(psi, dx, threshold=0.5)
+            avg_Vm = float(np.mean(Vm)) if electrostatics_on else 0.0
             
-            Apore = np.sum(1.0 - H) * dx * dy
-            eff_radius = np.sqrt(max(Apore, 0.0) / np.pi)
+            # Use robust radius calculation if noise is on
+            eff_radius = calculate_pore_radius_simple(smooth_step(psi), dx, dy)
 
             time_points.append(t)
             avg_Vm_vs_time.append(avg_Vm)
