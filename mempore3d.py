@@ -256,7 +256,7 @@ class AMGPoissonSolver:
         rhs = np.zeros(self.N, dtype=np.float64)
         _build_rhs_numba(rhs, Vm, self.dom.Nx, self.dom.Ny, self.shape[2],
                          self.k_mem_minus, self.k_mem_plus, V_applied)
-        phi_flat = self.ml.solve(rhs, tol=1e-8, maxiter=20)
+        phi_flat = self.ml.solve(rhs, tol=1e-12, maxiter=20)
         return phi_flat.reshape(self.shape, order="F")
 
 class ImplicitVMSolver:
@@ -394,7 +394,7 @@ def blend_properties(H: np.ndarray, props: MembraneProps, dom: Domain) -> Tuple[
     G_lipid, G_pore = 1.0 / props.R_lipid, 1.0 / props.R_pore
     G_m_map = G_pore + (G_lipid - G_pore) * H
     C_m_map = props.C_pore + (props.C_lipid - props.C_pore) * H
-    C_bath = 2.0 * EPS_W / dom.Lz
+    C_bath = 0.0 # 2.0 * EPS_W / dom.Lz
     C_eff_map = C_bath + C_m_map
     return G_m_map, C_m_map, C_eff_map
 
@@ -539,7 +539,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     nsteps = int(np.ceil(total_time / dt))
 
     if solver.surface_diffusion and solver.D_V == 0.0:
-        solver.D_V = 0.05 * dx**2 / dt
+        solver.D_V = 0.0 # 0.05 * dx**2 / dt
 
     # --- Setup Title and Print Info ---
     if electrostatics_on and phase_field_on:

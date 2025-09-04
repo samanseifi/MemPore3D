@@ -1,7 +1,7 @@
 from mempore3d import *
 
-Lx, Ly, Lz = 50e-9, 50e-9, 200e-9
-Nx, Ny, Nz = 128, 128, 129  # Nz should be odd to center membrane
+Lx, Ly, Lz = 10000e-9, 10000e-9, 20000e-9
+Nx, Ny, Nz = 64, 64, 65  # Nz should be odd to center membrane
 custom_domain = Domain(Lx=Lx, Ly=Ly, Lz=Lz, Nx=Nx, Ny=Ny, Nz=Nz)
 
 # Calculating dx for transition thickness    
@@ -11,22 +11,22 @@ dx = x[1] - x[0]
 # We need a reasonable dt and periodic rebuilding of the Vm solver.
 solver_params = SolverParams(
     save_frames=80,
-    implicit_dt_multiplier=10.0,    # A reasonable value for stability and speed.
+    implicit_dt_multiplier=200.0,    # A reasonable value for stability and speed.
     rebuild_vm_solver_every=25,     # Rebuild as the pore shape changes.
-    n_tau_total=100.0               # Simulate for 8x the membrane charging time.
+    n_tau_total=8.0               # Simulate for 8x the membrane charging time.
 )
 
 pore_growth_params = PhaseFieldParams(
     initial_state = 'pore',
-    initial_pore_radius=10e-9,
-    transition_thickness=1*dx,  
+    initial_pore_radius=500e-9,
+    transition_thickness=2*dx,  
     sigma_area=0,
-    mobility=5.0e4,
+    mobility=5.0e6,
     line_tension=1.5e-11,
     evolve='off'
 )
 
-high_voltage = Electrostatics(V_applied=1.0)
+high_voltage = Electrostatics(V_applied=0.5)
 thermal_params = None
 
 print("--- Starting Simulation: Voltage-Driven Pore Expansion ---")
