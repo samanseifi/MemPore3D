@@ -243,7 +243,7 @@ class AMGPoissonSolver:
         rhs = np.zeros(self.N, dtype=np.float64)
         _build_rhs_numba(rhs, Vm, self.dom.Nx, self.dom.Ny, self.shape[2],
                          self.k_mem_minus, self.k_mem_plus, V_applied)
-        phi_flat = self.ml.solve(rhs, tol=1e-8, maxiter=5)
+        phi_flat = self.ml.solve(rhs, tol=1e-8, maxiter=10)
         return phi_flat.reshape(self.shape, order="F")
 
 class ImplicitVMSolver:
