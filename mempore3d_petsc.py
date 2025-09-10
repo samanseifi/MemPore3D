@@ -1,36 +1,44 @@
 """
 Dynamic membrane pore simulation with coupled electrostatics and phase-field evolution.
-This version includes stochastic thermal noise to model pore nucleation.
+This version uses PETSc for parallel 3D electrostatics and includes stochastic
+thermal noise to model pore nucleation.
 
-This script models the charging of a lipid membrane containing a central pore that
-can change in size and shape over time. It couples two main physical models:
+This script models the charging of a lipid membrane that can spontaneously form
+and evolve pores. It couples two main physical models:
 
 1.  **Phase-Field Dynamics:** The pore's structure is represented by a phase-field
     variable `psi` (lipid=1, pore=0). The evolution of `psi` is governed by the
     stochastic Allen-Cahn equation, driven by line tension, a dynamic,
-    voltage-dependent surface tension, and thermal fluctuations.
+    voltage-dependent surface tension, and thermal fluctuations. The solver uses
+    a spectral method (FFT) for efficiency.
 
-2.  **Coupled Electrostatics:** The electrical behavior is modeled using a fully
-    coupled, semi-implicit solver. The 3D electrolyte potential (`phi_elec`) and
-    the 2D transmembrane potential (`Vm`) are solved self-consistently using PETSc for the
-    parallel 3D Poisson solve.
+2.  **Coupled Electrostatics:** The electrical behavior is modeled using a
+    semi-implicit scheme. The 3D electrolyte potential (`phi_elec`) is solved
+    using a parallel PETSc/GAMG Poisson solver, which is coupled to a 2D
+    implicit solver for the transmembrane potential (`Vm`). This approach
+    self-consistently captures the interaction between the bulk electrolyte
+    and the membrane surface.
 
 The coupling is bidirectional: the pore's shape determines the local electrical
-properties, and in turn, the electric field adds an electromechanical surface
-tension that lowers the energy barrier for thermal nucleation and drives pore expansion.
+properties (conductance, capacitance), and in turn, the electric field adds an
+electromechanical surface tension that lowers the energy barrier for thermal
+nucleation and drives pore expansion.
 
 Key Features
 ------------
 - Stochastic Pore Nucleation: Thermodynamically consistent noise is added to the
-  phase-field evolution to simulate spontaneous pore formation.
+  phase-field evolution to simulate spontaneous pore formation from an intact membrane.
 - Dynamic Phase-Field: The pore evolves based on line tension and electrical stress.
-- Coupled Solvers: The phase-field evolution and electrostatics are solved in the same time loop.
-- Implicit Vm Solver: A `ImplicitVMSolver` class handles the stable time
-  evolution of Vm. The operator is rebuilt periodically.
-- Parallel Poisson Solver: The 3D Poisson equation is solved in parallel using petsc4py.
+- Parallel 3D Poisson Solver: The 3D Poisson equation for the electrolyte is
+  solved in parallel using petsc4py and MPI, with GAMG preconditioning.
+- Implicit 2D Vm Solver: A stable, semi-implicit solver handles the time
+  evolution of the 2D transmembrane potential, with a Numba-accelerated
+  matrix assembly.
+- Bidirectional Coupling: The phase-field and electrostatics are solved in the
+  same time loop, providing a tight coupling between pore structure and electrical forces.
 
 Author: Saman Seifi
-(Modified for petsc4py by Gemini)
+
 """
 from __future__ import annotations
 
@@ -69,19 +77,19 @@ class Domain:
 @dataclass
 class MembraneProps:
     """Intrinsic electrical properties of the membrane components."""
-    R_lipid: float = 1e7  # Lipid resistance, Ohm·m^2
-    C_lipid: float = 1e-2  # Lipid capacitance, F/m^2
-    R_pore: float = 1e-1   # Pore resistance (conductive), Ohm·m^2
-    C_pore: float = 1e-9   # Pore capacitance (near zero), F/m^2
+    R_lipid: float = 1e7            # Lipid resistance, Ohm·m^2
+    C_lipid: float = 1e-2           # Lipid capacitance, F/m^2
+    R_pore: float = 1e-1            # Pore resistance (conductive), Ohm·m^2
+    C_pore: float = 1e-9            # Pore capacitance (near zero), F/m^2
 
 @dataclass
 class PhaseFieldParams:
     """Parameters for the phase-field model of the pore."""
     # --- Initial State ---
-    initial_state: str = 'pore'  # Can be 'pore' or 'intact'
-    initial_pore_radius: float = 10e-9  # m, Used if initial_state is 'pore'
-    intact_noise_level: float = 1e-4    # Used if initial_state is 'intact'
-    transition_thickness: float | None = None  # If None, defaults to 0.5*dx
+    initial_state: str = 'pore'                 # Can be 'pore' or 'intact'
+    initial_pore_radius: float = 10e-9          # m, Used if initial_state is 'pore'
+    intact_noise_level: float = 1e-4            # Used if initial_state is 'intact'
+    transition_thickness: float | None = None   # If None, defaults to 0.5*dx
     # --- Dynamics ---
     line_tension: float = 1.5e-11 # J/m, aka 'gamma'
     mobility: float = 5000.0      # m^2/(J*s), aka 'M'
@@ -91,26 +99,26 @@ class PhaseFieldParams:
 @dataclass
 class ThermalParams:
     """Parameters for thermal fluctuations."""
-    T: float = 300.0  # Temperature in Kelvin
-    k_B: float = 1.380649e-23  # Boltzmann constant, J/K
-    add_noise: bool = True # Flag to turn noise on/off
+    T: float = 300.0            # Temperature in Kelvin
+    k_B: float = 1.380649e-23   # Boltzmann constant, J/K
+    add_noise: bool = True      # Flag to turn noise on/off
 
 @dataclass
 class Electrostatics:
     """Parameters for the electrostatic environment."""
-    sigma_e: float = 1.0   # Electrolyte conductivity, S/m
-    V_applied: float = 0.5   # Applied voltage across the box, V
+    sigma_e: float = 1.0        # Electrolyte conductivity, S/m
+    V_applied: float = 0.5      # Applied voltage across the box, V
 
 @dataclass
 class SolverParams:
     """Parameters controlling the numerical solver."""
     surface_diffusion: bool = True
-    D_V: float = 0.0            # If 0, set adaptively
-    dt_safety: float = 0.01     # Safety factor for base time step calculation
-    n_tau_total: float = 8.0    # Total simulation time in units of lipid RC time
-    save_frames: int = 40       # Number of frames to save for visualization
-    implicit_dt_multiplier: float = 100.0 # Factor to increase dt for implicit Vm solver
-    rebuild_vm_solver_every: int = 20 # Rebuild the Vm implicit matrix every N steps
+    D_V: float = 0.0                        # If 0, set adaptively
+    dt_safety: float = 0.01                 # Safety factor for base time step calculation
+    n_tau_total: float = 8.0                # Total simulation time in units of lipid RC time
+    save_frames: int = 40                   # Number of frames to save for visualization
+    implicit_dt_multiplier: float = 100.0   # Factor to increase dt for implicit Vm solver
+    rebuild_vm_solver_every: int = 20       # Rebuild the Vm implicit matrix every N steps
 
 # -----------------------------------------------------------------------------
 # Numba-JIT Compiled Core Routines
@@ -162,7 +170,7 @@ def build_vm_implicit_operator(dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e,
     """Builds the sparse matrix for the implicit Vm solve using a Numba kernel."""
     Nx, Ny = dom.Nx, dom.Ny
     base_G_sc = 2.0 * sigma_e / Lz
-    G_sc_map = 500.0 * base_G_sc * (1.0 - H)
+    G_sc_map = 50.0 * base_G_sc * (1.0 - H)
     G_total_map = G_m_map + G_sc_map
 
     C_eff_flat = C_eff_map.flatten(order='C')
@@ -228,7 +236,6 @@ class PETScPoissonGAMG:
                 cols += [self.gid(i,j-1,k), self.gid(i,j+1,k)]
                 vals += [-self.cy, -self.cy]; diag += 2.0*self.cy
 
-            # ### FINAL FIX: Corrected Z-neighbor assembly loop ###
             # Z-neighbors (interior stencil for now, Dirichlet BCs handled by zeroRowsColumns)
             # This robustly adds the full diagonal contribution before BCs are applied.
             if k > 0:
@@ -268,7 +275,6 @@ class PETScPoissonGAMG:
         """
         Set boundary values into x and zero rows+cols with unit diag.
         """
-        # ### FIX 2: Restore the working matrix from the pristine copy ###
         # self.A_pristine.copy(self.A, structure=PETSc.Mat.Structure.SAME_NONZERO_PATTERN)
         self.A.destroy()
         self.A = self.A_pristine.copy()
@@ -551,7 +557,6 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
 
         sigma_elec = 0.0
         if electrostatics_on:
-            # ### MODIFICATION: Cleaned up Vm solver rebuild logic ###
             if rank == 0:
                 if n % solver.rebuild_vm_solver_every == 0 or vm_implicit_solver is None:
                     if n > 0:
@@ -621,5 +626,6 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
             elec_params=elec, solver_params=solver, thermal_params=thermal
         )
         print(f"Numerical results saved to {filename}")
+    comm.Barrier()
 
 
