@@ -42,20 +42,20 @@ Author: Saman Seifi
 """
 from __future__ import annotations
 
-import numpy as np
-import matplotlib.pyplot as plt
+import os
+import time
 from dataclasses import dataclass
 from typing import Tuple, Optional
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-import time
-import numba
-from scipy.sparse import coo_matrix, csc_matrix
-from scipy.sparse.linalg import factorized
-from scipy.ndimage import label
 
-# --- PETSc Poisson with GAMG, Neumann-x/y, Dirichlet z-planes ---
-from petsc4py import PETSc
+import matplotlib.pyplot as plt
+import numba
+import numpy as np
 from mpi4py import MPI
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from petsc4py import PETSc
+from scipy import fft as spfft
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import factorized
 
 # --- Physical Constants ---
 EPS0 = 8.8541878128e-12  # Vacuum permittivity, F/m
@@ -335,27 +335,47 @@ class ImplicitVMSolver:
         return x_flat.reshape((self.Nx, self.Ny), order='C')
 
 class PhaseFieldSolver:
-    """Solver for the stochastic Allen-Cahn evolution of the phase field `psi`."""
-    def __init__(self, dom: Domain, phase_params: PhaseFieldParams, thermal_params: ThermalParams, dx: float, dt: float):
+    """
+    Stochastic Allen–Cahn with spectral (FFT) time stepping using scipy.fft.
+    Uses rfft2/irfft2 (real transforms) + keeps psi_hat to avoid fft(psi) each step.
+
+    Key Features:
+    - Semi-implicit spectral update for phase-field evolution.
+    - Thermodynamically consistent thermal noise for stochastic pore nucleation.
+    - Efficient handling of real FFTs with precomputed wavenumbers.
+    - Smooth-step blending and double-well potential derivatives for phase-field dynamics.
+    - Noise amplitude derived from thermal parameters.
+    """
+    def __init__(self, dom: Domain, phase_params: PhaseFieldParams,
+                 thermal_params: ThermalParams, dx: float, dt: float, workers: Optional[int]=None):
         self.params = phase_params
         self.thermal = thermal_params
-        self.Cg = np.sqrt(2.0) / 12.0
+        self.dom = dom
         self.dx = dx
         self.dt = dt
-        self.dom = dom
-        
-        kx = 2.0 * np.pi * np.fft.fftfreq(dom.Nx, d=dx)
-        ky = 2.0 * np.pi * np.fft.fftfreq(dom.Ny, d=dx)
+        self.workers = int(workers or os.cpu_count() or 1)
+        self.Cg = np.sqrt(2.0) / 12.0
+
+        kx = 2.0 * np.pi * spfft.fftfreq(dom.Nx, d=dx)
+        ky = 2.0 * np.pi * spfft.rfftfreq(dom.Ny, d=dx)
         KX, KY = np.meshgrid(kx, ky, indexing='ij')
         self.K2 = KX**2 + KY**2
-        
-        self.denom = 1.0 + self.dt * self.params.mobility * (self.params.line_tension / self.Cg) * self.params.transition_thickness * self.K2
-        
+
+        if self.params.transition_thickness is None:
+            self.params.transition_thickness = 1.5 * dx
+
+        M = self.params.mobility
+        gam = self.params.line_tension
+        tth = self.params.transition_thickness
+        self.denom = 1.0 + self.dt * M * (gam / self.Cg) * tth * self.K2
+
         if self.thermal.add_noise:
-            noise_variance = (2 * self.params.mobility * self.thermal.k_B * self.thermal.T) / (self.dx * self.dx * self.dt)
-            self.noise_amplitude = np.sqrt(noise_variance)
+            self.noise_amplitude = np.sqrt((2 * M * self.thermal.k_B * self.thermal.T) / (dx * dx * self.dt))
         else:
             self.noise_amplitude = 0.0
+
+        self._rhs_real = np.empty((dom.Nx, dom.Ny), dtype=np.float64)
+        self.psi_hat = None
 
     @staticmethod
     @numba.njit(cache=True)
@@ -368,25 +388,30 @@ class PhaseFieldSolver:
         psi_clipped = np.clip(psi, 0.0, 1.0)
         return 6.0 * psi_clipped * (1.0 - psi_clipped)
 
-    def evolve(self, psi, sigma_map: np.ndarray):
-        """Advance the phase field by one time step `dt`."""
-        deterministic_rhs = -self.params.mobility * (
+    def evolve(self, psi_in: np.ndarray, sigma_map: np.ndarray) -> np.ndarray:
+        if self.psi_hat is None:
+            self.psi_hat = spfft.rfft2(psi_in, workers=self.workers)
+            psi = psi_in
+        else:
+            psi = spfft.irfft2(self.psi_hat, s=psi_in.shape, workers=self.workers).real
+
+        det_rhs = -self.params.mobility * (
             (self.params.line_tension / self.Cg) * (self._g_prime(psi) / self.params.transition_thickness) +
             sigma_map * self._dH_prime(psi)
         )
-        
-        if self.thermal.add_noise:
-            noise = self.noise_amplitude * np.random.randn(self.dom.Nx, self.dom.Ny)
-            rhs = deterministic_rhs + noise
+
+        if self.noise_amplitude != 0.0:
+            self._rhs_real[:] = det_rhs + self.noise_amplitude * np.random.randn(*psi.shape)
         else:
-            rhs = deterministic_rhs
-        
-        psi_hat = np.fft.fft2(psi)
-        rhs_hat = np.fft.fft2(rhs)
-        psi_hat_new = (psi_hat + self.dt * rhs_hat) / self.denom
-        
-        psi_new = np.fft.ifft2(psi_hat_new).real
-        return np.clip(psi_new, 0.0, 1.0)
+            self._rhs_real[:] = det_rhs
+
+        rhs_hat = spfft.rfft2(self._rhs_real, workers=self.workers)
+        self.psi_hat = (self.psi_hat + self.dt * rhs_hat) / self.denom
+
+        psi_new = spfft.irfft2(self.psi_hat, s=psi.shape, workers=self.workers).real
+        np.clip(psi_new, 0.0, 1.0, out=psi_new)
+        return psi_new
+
 
 def create_grid(dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     """Creates the computational grid."""
@@ -540,7 +565,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
 
     # --- Initialize Solvers (on all ranks as needed) ---
     psi = initialize_phase_field(phase, x, y)
-    phase_field_solver = PhaseFieldSolver(dom, phase, thermal, dx, dt) if phase_field_on else None
+    phase_field_solver = PhaseFieldSolver(dom, phase, thermal, dx, dt, workers=os.cpu_count()) if phase_field_on else None
     poisson = PETScPoissonGAMG(dom.Nx, dom.Ny, dom.Nz, dx, dy, dz) if electrostatics_on else None
     vm_implicit_solver = None
 
@@ -574,9 +599,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
             if rank == 0:
                 b_rhs_2d = C_eff_map * Vm + dt * J_elec_coupled
                 Vm = vm_implicit_solver.solve(b_rhs_2d.flatten(order='C'))
-                
-                
-            
+                 
             Vm = comm.bcast(Vm if rank == 0 else None, root=0)
             sigma_elec = 0.5 * C_m_map * (Vm**2)
             
