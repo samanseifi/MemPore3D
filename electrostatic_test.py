@@ -1,4 +1,4 @@
-from mempore3d import *
+from mempore3d_petsc import *
 
 Lx, Ly, Lz = 10000e-9, 10000e-9, 20000e-9
 Nx, Ny, Nz = 64, 64, 65  # Nz should be odd to center membrane
@@ -11,14 +11,14 @@ dx = x[1] - x[0]
 # We need a reasonable dt and periodic rebuilding of the Vm solver.
 solver_params = SolverParams(
     save_frames=80,
-    implicit_dt_multiplier=200.0,    # A reasonable value for stability and speed.
+    implicit_dt_multiplier=100.0,    # A reasonable value for stability and speed.
     rebuild_vm_solver_every=25,     # Rebuild as the pore shape changes.
     n_tau_total=8.0               # Simulate for 8x the membrane charging time.
 )
 
 pore_growth_params = PhaseFieldParams(
     initial_state = 'pore',
-    initial_pore_radius=500e-9,
+    initial_pore_radius=100e-9,
     transition_thickness=2*dx,  
     sigma_area=0,
     mobility=5.0e6,
@@ -26,7 +26,7 @@ pore_growth_params = PhaseFieldParams(
     evolve='off'
 )
 
-high_voltage = Electrostatics(V_applied=0.5)
+high_voltage = Electrostatics(V_applied=5.0)
 thermal_params = None
 
 print("--- Starting Simulation: Voltage-Driven Pore Expansion ---")

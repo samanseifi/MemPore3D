@@ -162,7 +162,7 @@ def build_vm_implicit_operator(dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e,
     """Builds the sparse matrix for the implicit Vm solve using a Numba kernel."""
     Nx, Ny = dom.Nx, dom.Ny
     base_G_sc = 2.0 * sigma_e / Lz
-    G_sc_map = 50.0 * base_G_sc * (1.0 - H)
+    G_sc_map = 500.0 * base_G_sc * (1.0 - H)
     G_total_map = G_m_map + G_sc_map
 
     C_eff_flat = C_eff_map.flatten(order='C')
@@ -210,6 +210,7 @@ class PETScPoissonGAMG:
             k = t // self.Ny
 
             diag = 0.0; cols=[]; vals=[]
+            # X-neighbors (Neumann)
             if i == 0:
                 cols.append(self.gid(i+1,j,k)); vals.append(-2.0*self.cx); diag += 2.0*self.cx
             elif i == self.Nx-1:
@@ -218,6 +219,7 @@ class PETScPoissonGAMG:
                 cols += [self.gid(i-1,j,k), self.gid(i+1,j,k)]
                 vals += [-self.cx, -self.cx]; diag += 2.0*self.cx
 
+            # Y-neighbors (Neumann)
             if j == 0:
                 cols.append(self.gid(i,j+1,k)); vals.append(-2.0*self.cy); diag += 2.0*self.cy
             elif j == self.Ny-1:
@@ -226,21 +228,23 @@ class PETScPoissonGAMG:
                 cols += [self.gid(i,j-1,k), self.gid(i,j+1,k)]
                 vals += [-self.cy, -self.cy]; diag += 2.0*self.cy
 
+            # ### FINAL FIX: Corrected Z-neighbor assembly loop ###
+            # Z-neighbors (interior stencil for now, Dirichlet BCs handled by zeroRowsColumns)
+            # This robustly adds the full diagonal contribution before BCs are applied.
             if k > 0:
-                cols.append(self.gid(i,j,k-1)); vals.append(-self.cz); diag += self.cz
+                cols.append(self.gid(i,j,k-1)); vals.append(-self.cz)
             if k < self.Nz-1:
-                cols.append(self.gid(i,j,k+1)); vals.append(-self.cz); diag += self.cz
+                cols.append(self.gid(i,j,k+1)); vals.append(-self.cz)
+            diag += 2.0*self.cz # Full diagonal term for Z
 
             cols.append(row); vals.append(diag)
             self.A.setValues([row], cols, vals)
 
         self.A.assemblyBegin(); self.A.assemblyEnd()
         self.b.assemblyBegin(); self.b.assemblyEnd()
-
-        # ### FIX 1: Create a pristine copy of the assembled matrix ###
+        
         self.A_pristine = self.A.copy()
 
-        # KSP + GAMG
         self.ksp = PETSc.KSP().create(comm=self.comm)
         self.ksp.setOperators(self.A)
         self.ksp.setType('cg')
@@ -265,8 +269,10 @@ class PETScPoissonGAMG:
         Set boundary values into x and zero rows+cols with unit diag.
         """
         # ### FIX 2: Restore the working matrix from the pristine copy ###
-        self.A_pristine.copy(self.A, structure=PETSc.Mat.Structure.SAME_NONZERO_PATTERN)
-
+        # self.A_pristine.copy(self.A, structure=PETSc.Mat.Structure.SAME_NONZERO_PATTERN)
+        self.A.destroy()
+        self.A = self.A_pristine.copy()
+        self.ksp.setOperators(self.A)
         self.x.set(0.0); self.b.set(0.0)
 
         for r in self.rows_z0: self.x.setValue(r, -0.5 * V_applied)
@@ -410,7 +416,7 @@ def blend_properties(H: np.ndarray, props: MembraneProps, dom: Domain) -> Tuple[
     G_lipid, G_pore = 1.0 / props.R_lipid, 1.0 / props.R_pore
     G_m_map = G_pore + (G_lipid - G_pore) * H
     C_m_map = props.C_pore + (props.C_lipid - props.C_pore) * H
-    C_bath = 2.0 * EPS_W / dom.Lz
+    C_bath = 0 # 2.0 * EPS_W / dom.Lz
     C_eff_map = C_bath + C_m_map
     return G_m_map, C_m_map, C_eff_map
 
@@ -421,7 +427,7 @@ def blend_properties_sharp(psi: np.ndarray, props: MembraneProps, dom: Domain) -
     C_lipid, C_pore = props.C_lipid, props.C_pore
     G_m_map = G_pore + (G_lipid - G_pore) * is_lipid_mask
     C_m_map = C_pore + (C_lipid - C_pore) * is_lipid_mask
-    C_bath = 2.0 * EPS_W / dom.Lz
+    C_bath = 0 # 2.0 * EPS_W / dom.Lz
     C_eff_map = C_bath + C_m_map
     return G_m_map, C_m_map, C_eff_map
 
@@ -508,7 +514,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     nsteps = int(np.ceil(total_time / dt))
 
     if solver.surface_diffusion and solver.D_V == 0.0:
-        solver.D_V = 0.05 * dx**2 / dt
+        solver.D_V = 0.0 # 0.05 * dx**2 / dt
     
     title_prefix = "Coupled Electrostatics & Phase-Field"
 
@@ -563,6 +569,8 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
             if rank == 0:
                 b_rhs_2d = C_eff_map * Vm + dt * J_elec_coupled
                 Vm = vm_implicit_solver.solve(b_rhs_2d.flatten(order='C'))
+                
+                
             
             Vm = comm.bcast(Vm if rank == 0 else None, root=0)
             sigma_elec = 0.5 * C_m_map * (Vm**2)
