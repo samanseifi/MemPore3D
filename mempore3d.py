@@ -220,10 +220,10 @@ def _build_laplacian_SPD(dom, dx, dy, dz, k_mem_minus, k_mem_plus):
     A = coo_matrix((diag_vals[:nnz], (row_idx[:nnz], col_idx[:nnz])), shape=(Nx*Ny*Nz, Nx*Ny*Nz)).tocsr()
     return A
 
-def build_vm_implicit_operator(dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, Lz):
+def build_vm_implicit_operator(dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, d):
     """Builds the sparse matrix for the implicit Vm solve using a Numba kernel."""
     Nx, Ny = dom.Nx, dom.Ny
-    base_G_sc = 2.0 * sigma_e / Lz
+    base_G_sc = 2.0 * sigma_e / d
     G_sc_map = 50.0 * base_G_sc * (1.0 - H)
     G_total_map = G_m_map + G_sc_map
 
@@ -261,9 +261,9 @@ class AMGPoissonSolver:
 
 class ImplicitVMSolver:
     """Solver for the semi-implicit update of the 2D transmembrane potential Vm."""
-    def __init__(self, dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, Lz):
+    def __init__(self, dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, d):
         self.Nx, self.Ny = dom.Nx, dom.Ny
-        A = build_vm_implicit_operator(dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, Lz)
+        A = build_vm_implicit_operator(dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, d)
         self.solver = factorized(A)
         
     def solve(self, b_flat):
@@ -591,7 +591,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
                 if n > 0: print(f"Step {n}: Rebuilding Vm implicit solver...")
                 H_for_solver = (psi > 0.5).astype(float) if thermal.add_noise else smooth_step(psi)
                 vm_implicit_solver = ImplicitVMSolver(
-                    dom, C_eff_map, G_m_map, H_for_solver, dt, dx, solver.D_V, elec.sigma_e, dom.Lz
+                    dom, C_eff_map, G_m_map, H_for_solver, dt, dx, solver.D_V, elec.sigma_e, 2*dz
                 )
 
             phi_elec = phi_elec_solver.solve(Vm, elec.V_applied)

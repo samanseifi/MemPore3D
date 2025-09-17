@@ -166,10 +166,10 @@ def calculate_J_from_phi(phi, k_plane_index, sigma_e, dz):
 # -----------------------------------------------------------------------------
 # Solvers and High-Level Routines
 # -----------------------------------------------------------------------------
-def build_vm_implicit_operator(dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, Lz):
+def build_vm_implicit_operator(dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, d):
     """Builds the sparse matrix for the implicit Vm solve using a Numba kernel."""
     Nx, Ny = dom.Nx, dom.Ny
-    base_G_sc = 2.0 * sigma_e / Lz
+    base_G_sc = 2.0 * sigma_e / d
     G_sc_map = 50.0 * base_G_sc * (1.0 - H)
     G_total_map = G_m_map + G_sc_map
 
@@ -324,9 +324,9 @@ class PETScPoissonGAMG:
 
 class ImplicitVMSolver:
     """Solver for the semi-implicit update of the 2D transmembrane potential Vm."""
-    def __init__(self, dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, Lz):
+    def __init__(self, dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, d):
         self.Nx, self.Ny = dom.Nx, dom.Ny
-        A = build_vm_implicit_operator(dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, Lz)
+        A = build_vm_implicit_operator(dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e, d)
         self.solver = factorized(A)
         
     def solve(self, b_flat):
@@ -447,7 +447,7 @@ def blend_properties(H: np.ndarray, props: MembraneProps, dom: Domain) -> Tuple[
     G_lipid, G_pore = 1.0 / props.R_lipid, 1.0 / props.R_pore
     G_m_map = G_pore + (G_lipid - G_pore) * H
     C_m_map = props.C_pore + (props.C_lipid - props.C_pore) * H
-    C_bath = 0 # 2.0 * EPS_W / dom.Lz
+    C_bath = 2.0 * EPS_W / dom.Lz
     C_eff_map = C_bath + C_m_map
     return G_m_map, C_m_map, C_eff_map
 
@@ -458,7 +458,7 @@ def blend_properties_sharp(psi: np.ndarray, props: MembraneProps, dom: Domain) -
     C_lipid, C_pore = props.C_lipid, props.C_pore
     G_m_map = G_pore + (G_lipid - G_pore) * is_lipid_mask
     C_m_map = C_pore + (C_lipid - C_pore) * is_lipid_mask
-    C_bath = 0 # 2.0 * EPS_W / dom.Lz
+    C_bath = 2.0 * EPS_W / dom.Lz
     C_eff_map = C_bath + C_m_map
     return G_m_map, C_m_map, C_eff_map
 
@@ -588,7 +588,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
                         print(f"Step {n}: Rebuilding Vm implicit solver...")
                     H_for_solver = (psi > 0.5).astype(float) if thermal.add_noise else smooth_step(psi)
                     vm_implicit_solver = ImplicitVMSolver(
-                        dom, C_eff_map, G_m_map, H_for_solver, dt, dx, solver.D_V, elec.sigma_e, dom.Lz
+                        dom, C_eff_map, G_m_map, H_for_solver, dt, dx, solver.D_V, elec.sigma_e, 2*dz
                     )
             
             Vm = comm.bcast(Vm if rank == 0 else None, root=0)
