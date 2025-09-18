@@ -106,7 +106,7 @@ def plot_potential_slice(phi_slice, E_field, x_nm, z_nm, filename="potential_sli
     plt.close(fig)
 
 def main(filepath: str):
-    """Main function to load data and generate all plots."""
+    """Main function to load data, generate plots, and compute pore current."""
     # --- 1. Setup and Load Data ---
     if not os.path.exists(filepath):
         print(f"❌ Error: File not found at '{filepath}'")
@@ -118,10 +118,12 @@ def main(filepath: str):
         x, y, z = data['x'], data['y'], data['z']
         Vm, phi, H = data['Vm'], data['phi_elec'], data['H']
         time_points, avg_Vm_vs_time = data['time_points'], data['avg_Vm_vs_time']
+        # Attempt to load conductivity, provide a default if not present
+        sigma_eff = data.get('sigma_eff', 1.0) # S/m, default to 1.0 if not in file
 
     # Scale coordinates and time for plotting
-    x_nm, y_nm, z_nm = x * 1e6, y * 1e6, z * 1e6
-    time_ns = time_points * 1e6
+    x_nm, y_nm, z_nm = x * 1e9, y * 1e9, z * 1e9 # Changed to nm for consistency
+    time_ns = time_points * 1e9 # Changed to ns for consistency
 
     # --- 2. Generate Each Plot ---
     print("✨ Generating plots...")
@@ -137,16 +139,47 @@ def main(filepath: str):
 
     # D) Potential Slice with E-Field
     dx, dy, dz = x[1] - x[0], y[1] - y[0], z[1] - z[0]
-
     Ex, Ey, Ez = np.gradient(-phi, dx, dy, dz)
     y_slice_idx = phi.shape[1] // 2
     phi_slice = phi[:, y_slice_idx, :]
     E_field_slice = (Ex[:, y_slice_idx, :], Ez[:, y_slice_idx, :])
+    # Note: Corrected the units in the plot to nm for consistency
     plot_potential_slice(phi_slice, E_field_slice, x_nm, z_nm, filename="potential_slice_c.pdf")
 
-    print("\n✅ All plots generated successfully.")
+    # --- 3. Compute Pore Current ---
+    print("🔬 Computing pore current...")
+    
+    # A) Identify the z-index of the membrane center (assumed to be at z=0)
+    k_m_idx = np.argmin(np.abs(z))
+    
+    # B) Calculate the potential difference across the membrane, one grid point on each side
+    # ΔΦ = Φ(z = +Δz/2) - Φ(z = -Δz/2)
+    delta_phi_z = phi[:, :, k_m_idx + 1] - phi[:, :, k_m_idx - 1]
+    
+    # C) Calculate the z-component of current density J_z across the entire xy-plane
+    # Using your formula: J_elec = -λ² * ΔΦ / Δz
+    # We assume λ² is an effective conductivity, which we'll call sigma_eff
+    J_z = -sigma_eff * delta_phi_z / dz
+    
+    # D) Identify the pore region using the phase field H
+    # We assume the pore is where H < 0.5 (i.e., the non-membrane region)
+    pore_mask = (H < 0.5)
+    
+    # E) Apply the mask to get current density only in the pore
+    J_pore = J_z * pore_mask
+    
+    # F) Integrate over the pore area to get the total current I_pore
+    # I = ∫ J dA ≈ Σ (J * dA) where dA = dx * dy
+    dA = dx * dy
+    I_pore = np.sum(J_pore) * dA
+    
+    # Convert to nanoamperes (nA) for a more readable output
+    I_pore_nA = I_pore * 1e9 
+    print(f"  -> Computed Pore Current (I_pore): {I_pore_nA:.4f} nA")
+
+    print("\n✅ All plots generated and calculations completed successfully.")
 
 
-npz_filepath = "membrane_simulation_results.npz"
+npz_filepath = "membrane_simulation_results_64_petsc_fixed.npz"
 
 main(npz_filepath)
