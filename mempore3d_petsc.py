@@ -77,18 +77,18 @@ class Domain:
 @dataclass
 class MembraneProps:
     """Intrinsic electrical properties of the membrane components."""
-    R_lipid: float = 1e7            # Lipid resistance, Ohm·m^2
-    C_lipid: float = 1e-2           # Lipid capacitance, F/m^2
-    R_pore: float = 1e-1            # Pore resistance (conductive), Ohm·m^2
-    C_pore: float = 1e-9            # Pore capacitance (near zero), F/m^2
+    R_lipid: float = 1e7          # Lipid resistance, Ohm·m^2
+    C_lipid: float = 1e-2          # Lipid capacitance, F/m^2
+    R_pore: float = 1e-1           # Pore resistance (conductive), Ohm·m^2
+    C_pore: float = 1e-9           # Pore capacitance (near zero), F/m^2
 
 @dataclass
 class PhaseFieldParams:
     """Parameters for the phase-field model of the pore."""
     # --- Initial State ---
-    initial_state: str = 'pore'                 # Can be 'pore' or 'intact'
-    initial_pore_radius: float = 10e-9          # m, Used if initial_state is 'pore'
-    intact_noise_level: float = 1e-4            # Used if initial_state is 'intact'
+    initial_state: str = 'pore'           # Can be 'pore' or 'intact'
+    initial_pore_radius: float = 10e-9        # m, Used if initial_state is 'pore'
+    intact_noise_level: float = 1e-4          # Used if initial_state is 'intact'
     transition_thickness: float | None = None   # If None, defaults to 0.5*dx
     # --- Dynamics ---
     line_tension: float = 1.5e-11 # J/m, aka 'gamma'
@@ -99,25 +99,25 @@ class PhaseFieldParams:
 @dataclass
 class ThermalParams:
     """Parameters for thermal fluctuations."""
-    T: float = 300.0            # Temperature in Kelvin
-    k_B: float = 1.380649e-23   # Boltzmann constant, J/K
-    add_noise: bool = True      # Flag to turn noise on/off
+    T: float = 300.0          # Temperature in Kelvin
+    k_B: float = 1.380649e-23  # Boltzmann constant, J/K
+    add_noise: bool = True    # Flag to turn noise on/off
 
 @dataclass
 class Electrostatics:
     """Parameters for the electrostatic environment."""
-    sigma_e: float = 1.0        # Electrolyte conductivity, S/m
-    V_applied: float = 0.5      # Applied voltage across the box, V
+    sigma_e: float = 1.0      # Electrolyte conductivity, S/m
+    V_applied: float = 0.5    # Applied voltage across the box, V
 
 @dataclass
 class SolverParams:
     """Parameters controlling the numerical solver."""
     surface_diffusion: bool = True
-    D_V: float = 0.0                        # If 0, set adaptively
-    dt_safety: float = 0.01                 # Safety factor for base time step calculation
-    n_tau_total: float = 8.0                # Total simulation time in units of lipid RC time
-    save_frames: int = 40                   # Number of frames to save for visualization
-    implicit_dt_multiplier: float = 100.0   # Factor to increase dt for implicit Vm solver
+    D_V: float = 0.0                      # If 0, set adaptively
+    dt_safety: float = 0.01                   # Safety factor for base time step calculation
+    n_tau_total: float = 8.0                  # Total simulation time in units of lipid RC time
+    save_frames: int = 40                     # Number of frames to save for visualization
+    implicit_dt_multiplier: float = 100.0     # Factor to increase dt for implicit Vm solver
     rebuild_vm_solver_every: int = 20       # Rebuild the Vm implicit matrix every N steps
 
 # -----------------------------------------------------------------------------
@@ -275,7 +275,6 @@ class PETScPoissonGAMG:
         """
         Set boundary values into x and zero rows+cols with unit diag.
         """
-        # self.A_pristine.copy(self.A, structure=PETSc.Mat.Structure.SAME_NONZERO_PATTERN)
         self.A.destroy()
         self.A = self.A_pristine.copy()
         self.ksp.setOperators(self.A)
@@ -435,7 +434,7 @@ def initialize_phase_field(params: PhaseFieldParams, x: np.ndarray, y: np.ndarra
         xx, yy = np.meshgrid(x, y, indexing="ij")
         r = np.sqrt(xx**2 + yy**2)
         psi = 0.5 * (1.0 - np.tanh((params.initial_pore_radius - r) /
-                                  (np.sqrt(2.0) * params.transition_thickness)))
+                                 (np.sqrt(2.0) * params.transition_thickness)))
         return psi
     elif params.initial_state == 'intact':
         psi = np.ones((len(x), len(y)), dtype=float)
@@ -586,7 +585,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
         if electrostatics_on:
             if rank == 0:
                 if n % solver.rebuild_vm_solver_every == 0 or vm_implicit_solver is None:
-                    if n > 0:
+                    if n > 0 and rank == 0:
                         print(f"Step {n}: Rebuilding Vm implicit solver...")
                     H_for_solver = (psi > 0.5).astype(float) if thermal.add_noise else smooth_step(psi)
                     vm_implicit_solver = ImplicitVMSolver(
@@ -601,18 +600,22 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
             if rank == 0:
                 b_rhs_2d = C_eff_map * Vm + dt * J_elec_coupled
                 Vm = vm_implicit_solver.solve(b_rhs_2d.flatten(order='C'))
-                 
+                
             Vm = comm.bcast(Vm if rank == 0 else None, root=0)
             sigma_elec = 0.5 * C_m_map * (Vm**2)
             
         if phase_field_on:
             sigma_total_map = phase.sigma_area + sigma_elec
-            psi = phase_field_solver.evolve(psi, sigma_total_map)
+            if rank == 0:
+                psi = phase_field_solver.evolve(psi, sigma_total_map)
+            # Broadcast the updated phase field to all processes to ensure consistency
+            psi = comm.bcast(psi, root=0)
         
         if n % save_interval == 0 or n == nsteps - 1:
             t = (n + 1) * dt
-            avg_Vm = float(np.mean(Vm)) if electrostatics_on else 0.0
+            # Ensure psi is consistent before calculating radius on rank 0
             eff_radius = calculate_pore_radius_simple(smooth_step(psi), dx, dy)
+            avg_Vm = float(np.mean(Vm)) if electrostatics_on else 0.0
 
             if rank == 0:
                 time_points.append(t)
@@ -621,16 +624,15 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
                 print(f"Time: {t*1e9:8.2f} ns [{n+1:>{len(str(nsteps))}}/{nsteps}] | Avg Vm: {avg_Vm:.4f} V | Pore R: {eff_radius*1e9:.2f} nm")
 
     # --- Output Results ---
+    # Final state is already synchronized from the last loop iteration
     if electrostatics_on:
-        scat, y = PETSc.Scatter.toZero(poisson.x)
-        scat.begin(poisson.x, y, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
-        scat.end  (poisson.x, y, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+        scat, phi_vec = PETSc.Scatter.toZero(poisson.x)
+        scat.begin(poisson.x, phi_vec, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+        scat.end  (poisson.x, phi_vec, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
         scat.destroy()
         if rank == 0:
-            phi_arr = y.getArray(readonly=True)
+            phi_arr = phi_vec.getArray(readonly=True)
             phi_elec_out = phi_arr.reshape(dom.Nz, dom.Ny, dom.Nx).transpose(2,1,0)
-        else:
-            phi_elec_out = None
     else:
         phi_elec_out = np.zeros((dom.Nx, dom.Ny, dom.Nz)) if rank == 0 else None
 
@@ -652,5 +654,4 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
         )
         print(f"Numerical results saved to {filename}")
     comm.Barrier()
-
 
