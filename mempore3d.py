@@ -205,8 +205,9 @@ def _build_rhs_numba(rhs, Vm, Nx, Ny, Nz, k_mem_minus, k_mem_plus, V_applied):
 @numba.njit(cache=True)
 def calculate_J_from_phi(phi, k_plane_index, sigma_e, dz):
     """Numba-jitted calculation of ionic current density from 3D potential."""
-    grad_phi_z = (phi[:, :, k_plane_index + 1] - phi[:, :, k_plane_index]) / dz
-    return sigma_e * grad_phi_z
+    grad_phi_z_top = (phi[:, :, k_plane_index + 1] - phi[:, :, k_plane_index]) / dz
+    grad_phi_z_bottom = (phi[:, :, k_plane_index] - phi[:, :, k_plane_index - 1]) / dz
+    return sigma_e * (grad_phi_z_top + grad_phi_z_bottom) / 2.0
 
 # -----------------------------------------------------------------------------
 # Solvers and High-Level Routines

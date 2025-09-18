@@ -303,22 +303,24 @@ class PETScPoissonGAMG:
         self.ksp.solve(self.b, self.x)
         return self.x
 
-    def current_slice_kplus(self, dz, sigma_e):
+    def current_slice_kplus_minus(self, dz, sigma_e):
         """
-        Compute J_z at k_mem_plus. Gathers full vector to rank 0.
-        Returns (Nx,Ny) ndarray on rank 0; returns None elsewhere.
+        Compute J_z at k_mem_plus and k_mem_minus. Gathers full vector to rank 0.
+        Returns a tuple of (J_plus, J_minus) as (Nx, Ny) ndarrays on rank 0; returns None elsewhere.
         """
         scat, y = PETSc.Scatter.toZero(self.x)
         scat.begin(self.x, y, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
-        scat.end  (self.x, y, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+        scat.end(self.x, y, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
         scat.destroy()
 
         if self.rank == 0:
             phi_flat = y.getArray(readonly=True)
             phi = phi_flat.reshape(self.Nz, self.Ny, self.Nx).transpose(2, 1, 0)
-            k = self.k_mem_plus
-            grad = (phi[:, :, k+1] - phi[:, :, k]) / dz
-            return sigma_e * grad
+            k_plus = self.k_mem_plus
+            k_minus = self.k_mem_minus
+            grad_plus = (phi[:, :, k_plus + 1] - phi[:, :, k_plus]) / dz
+            grad_minus = (phi[:, :, k_minus] - phi[:, :, k_minus - 1]) / dz
+            return sigma_e * (grad_plus + grad_minus)
         else:
             return None
 
@@ -594,7 +596,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
             Vm = comm.bcast(Vm if rank == 0 else None, root=0)
             poisson.apply_dirichlet_planes(Vm, elec.V_applied)
             poisson.solve()
-            J_elec_coupled = poisson.current_slice_kplus(dz, elec.sigma_e)
+            J_elec_coupled = poisson.current_slice_kplus_minus(dz, elec.sigma_e)
             
             if rank == 0:
                 b_rhs_2d = C_eff_map * Vm + dt * J_elec_coupled
