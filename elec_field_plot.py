@@ -7,7 +7,7 @@ for each key result, using LaTeX for text rendering.
 Usage:
     python generate_publication_plots.py [path_to_npz_file]
 
-If no path is provided, it defaults to 'membrane_charging_results.npz'.
+If no path is provided, it defaults to 'membrane_simulation_results.npz'.
 """
 import sys
 import os
@@ -41,8 +41,8 @@ def setup_matplotlib_for_latex():
 
 def plot_charging_curve(time_ns, avg_Vm_vs_time, filename="charging_curve.pdf"):
     """Plots and saves the average Vm charging curve."""
-    print(f"  -> Generating {filename}...")
-    fig, ax = plt.subplots(figsize=(3.25, 2.4))  # Standard one-column width
+    print(f"   -> Generating {filename}...")
+    fig, ax = plt.subplots(figsize=(2.4, 2.4))  # Standard one-column width
     ax.plot(time_ns, avg_Vm_vs_time, marker=".", linestyle="-", color="#1b9e77", markersize=3)
     ax.set_xlabel(r"Time $t$ (ns)")
     ax.set_ylabel(r"Average $V_m$ (V)")
@@ -52,17 +52,35 @@ def plot_charging_curve(time_ns, avg_Vm_vs_time, filename="charging_curve.pdf"):
     fig.savefig(filename, bbox_inches="tight")
     plt.close(fig)
 
+# --- New Function Added Here ---
+def plot_radius_evolution(time_ns, pore_radius_vs_time, filename="radius_evolution.pdf"):
+    """Plots and saves the pore radius evolution over time."""
+    print(f"   -> Generating {filename}...")
+    fig, ax = plt.subplots(figsize=(2.4, 2.4))
+    # Convert radius from meters to nanometers for plotting
+    pore_radius_nm = np.array(pore_radius_vs_time) * 1e9
+    ax.plot(time_ns, pore_radius_nm, marker=".", linestyle="-", color="#d95f02", markersize=3)
+    ax.set_xlabel(r"Time $t$ (ns)")
+    ax.set_ylabel(r"Effective Pore Radius (nm)")
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=30)
+    ax.grid(False)
+    fig.tight_layout(pad=0.1)
+    fig.savefig(filename, bbox_inches="tight")
+    plt.close(fig)
+# -----------------------------
+
 def plot_2d_map(data, x_nm, y_nm, cmap, cbar_label, filename):
     """Generic function to plot and save a 2D data map."""
-    print(f"  -> Generating {filename}...")
+    print(f"   -> Generating {filename}...")
     fig_width = 3.25
     aspect_ratio = data.shape[0] / data.shape[1]
     fig_height = fig_width * aspect_ratio
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
     im = ax.imshow(data.T, origin="lower", extent=[x_nm[0], x_nm[-1], y_nm[0], y_nm[-1]], cmap=cmap)
-    ax.set_xlabel(r"$x$ (nm)")
-    ax.set_ylabel(r"$y$ (nm)")
+    ax.set_xlabel(r"$x$ ($\mu$m)")
+    ax.set_ylabel(r"$y$ ($\mu$m)")
 
     divider = make_axes_locatable(ax)
     cax = divider.append_axes("right", size="5%", pad=0.1)
@@ -76,7 +94,7 @@ def plot_2d_map(data, x_nm, y_nm, cmap, cbar_label, filename):
 
 def plot_potential_slice(phi_slice, E_field, x_nm, z_nm, filename="potential_slice.pdf"):
     """Plots and saves the potential slice with E-field streamlines."""
-    print(f"  -> Generating {filename}...")
+    print(f"   -> Generating {filename}...")
     Ex_slice, Ez_slice = E_field
     fig_width = 3.25
     aspect_ratio = phi_slice.shape[1] / phi_slice.shape[0] # z/x
@@ -118,12 +136,15 @@ def main(filepath: str):
         x, y, z = data['x'], data['y'], data['z']
         Vm, phi, H = data['Vm'], data['phi_elec'], data['H']
         time_points, avg_Vm_vs_time = data['time_points'], data['avg_Vm_vs_time']
+        # --- Load pore_radius_vs_time ---
+        pore_radius_vs_time = data.get('pore_radius_vs_time', None)
+        # --------------------------------
         # Attempt to load conductivity, provide a default if not present
         sigma_eff = data.get('sigma_eff', 1.0) # S/m, default to 1.0 if not in file
 
     # Scale coordinates and time for plotting
-    x_nm, y_nm, z_nm = x * 1e9, y * 1e9, z * 1e9 # Changed to nm for consistency
-    time_ns = time_points * 1e9 # Changed to ns for consistency
+    x_um, y_um, z_um = x * 1e6, y * 1e6, z * 1e6 # Changed variable names for clarity (micrometers)
+    time_ns = time_points * 1e9 # Changed units for consistency
 
     # --- 2. Generate Each Plot ---
     print("✨ Generating plots...")
@@ -131,55 +152,59 @@ def main(filepath: str):
     # A) Average Vm Charging Curve
     plot_charging_curve(time_ns, avg_Vm_vs_time, filename="charging_curve_c.pdf")
 
-    # B) Phase Field Map
-    plot_2d_map(H, x_nm, y_nm, cmap="pink_r", cbar_label=r"Phase Field", filename="phase_field_map_c.pdf")
+    # B) Pore Radius Evolution
+    if pore_radius_vs_time is not None:
+        plot_radius_evolution(time_ns, pore_radius_vs_time, filename="radius_evolution_c.pdf")
+    else:
+        print("   -> Skipping radius plot (data not found in .npz file).")
 
-    # C) Final Vm Distribution
-    plot_2d_map(Vm, x_nm, y_nm, cmap="magma", cbar_label=r"$V_m$ (V)", filename="vm_distribution_map_c.pdf")
+    # C) Phase Field Map
+    plot_2d_map(H, x_um, y_um, cmap="pink_r", cbar_label=r"Phase Field", filename="phase_field_map_c.pdf")
 
-    # D) Potential Slice with E-Field
+    # D) Final Vm Distribution
+    plot_2d_map(Vm, x_um, y_um, cmap="magma", cbar_label=r"$V_m$ (V)", filename="vm_distribution_map_c.pdf")
+
+    # E) Potential Slice with E-Field
     dx, dy, dz = x[1] - x[0], y[1] - y[0], z[1] - z[0]
     Ex, Ey, Ez = np.gradient(-phi, dx, dy, dz)
     y_slice_idx = phi.shape[1] // 2
     phi_slice = phi[:, y_slice_idx, :]
     E_field_slice = (Ex[:, y_slice_idx, :], Ez[:, y_slice_idx, :])
-    # Note: Corrected the units in the plot to nm for consistency
-    plot_potential_slice(phi_slice, E_field_slice, x_nm, z_nm, filename="potential_slice_c.pdf")
+    plot_potential_slice(phi_slice, E_field_slice, x_um, z_um, filename="potential_slice_c.pdf")
 
-    # --- 3. Compute Pore Current ---
+    # --- 3. Compute Pore Current (Corrected Version) ---
     print("🔬 Computing pore current...")
     
-    # A) Identify the z-index of the membrane center (assumed to be at z=0)
+    # A) Get grid spacings.
+    dx, dy, dz = x[1] - x[0], y[1] - y[0], z[1] - z[0]
+    
+    # B) Find the z-index of the membrane's central plane.
     k_m_idx = np.argmin(np.abs(z))
     
-    # B) Calculate the potential difference across the membrane, one grid point on each side
-    # ΔΦ = Φ(z = +Δz/2) - Φ(z = -Δz/2)
+    # C) Calculate the z-component of the electric field (E_z = -dΦ/dz)
     delta_phi_z = phi[:, :, k_m_idx + 1] - phi[:, :, k_m_idx - 1]
+    E_z = -delta_phi_z / (2.0 * dz)
     
-    # C) Calculate the z-component of current density J_z across the entire xy-plane
-    # Using your formula: J_elec = -λ² * ΔΦ / Δz
-    # We assume λ² is an effective conductivity, which we'll call sigma_eff
-    J_z = -sigma_eff * delta_phi_z / dz
+    # D) Calculate the current density J_z = σ * E_z
+    J_z = sigma_eff * E_z
     
-    # D) Identify the pore region using the phase field H
-    # We assume the pore is where H < 0.5 (i.e., the non-membrane region)
-    pore_mask = (H < 0.5)
+    # E) Use the smooth phase field H for a weighted integral.
+    pore_weight = 1.0 - H
     
-    # E) Apply the mask to get current density only in the pore
-    J_pore = J_z * pore_mask
+    # F) Apply the weight to get the current density contribution from the pore.
+    J_pore_weighted = J_z * pore_weight
     
-    # F) Integrate over the pore area to get the total current I_pore
-    # I = ∫ J dA ≈ Σ (J * dA) where dA = dx * dy
+    # G) Integrate over the entire xy-plane area to get the total current I_pore.
     dA = dx * dy
-    I_pore = np.sum(J_pore) * dA
+    I_pore = np.sum(J_pore_weighted) * dA
     
     # Convert to nanoamperes (nA) for a more readable output
     I_pore_nA = I_pore * 1e9 
-    print(f"  -> Computed Pore Current (I_pore): {I_pore_nA:.4f} nA")
+    print(f"   -> Computed Pore Current (I_pore): {I_pore_nA:.4f} nA")
 
     print("\n✅ All plots generated and calculations completed successfully.")
 
 
-npz_filepath = "membrane_simulation_results_64_petsc_fixed.npz"
+npz_filepath = "membrane_simulation_results.npz"
 
 main(npz_filepath)
