@@ -632,12 +632,13 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
             # Ensure psi is consistent before calculating radius on rank 0
             eff_radius = calculate_pore_radius_simple(smooth_step(psi, phase.transition_thickness), dx, dy)
             avg_Vm = float(np.mean(Vm)) if electrostatics_on else 0.0
+            avg_sigma = float(np.mean(sigma_elec))
 
             if rank == 0:
                 time_points.append(t)
                 avg_Vm_vs_time.append(avg_Vm)
                 pore_radius_vs_time.append(eff_radius)
-                print(f"Time: {t*1e9:8.2f} ns [{n+1:>{len(str(nsteps))}}/{nsteps}] | Avg Vm: {avg_Vm:.4f} V | Pore R: {eff_radius*1e9:.2f} nm")
+                print(f"Time: {t*1e9:8.2f} ns [{n+1:>{len(str(nsteps))}}/{nsteps}] | Avg Vm: {avg_Vm:.4f} V | Avg Sigma: {avg_sigma:.4f} J/m^2 | Pore R: {eff_radius*1e9:.2f} nm")
 
     # --- Output Results ---
     # Final state is already synchronized from the last loop iteration

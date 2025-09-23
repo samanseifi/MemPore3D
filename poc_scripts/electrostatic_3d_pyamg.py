@@ -51,9 +51,9 @@ class Domain:
     Lx: float = 1000e-9
     Ly: float = 1000e-9
     Lz: float = 2000e-9
-    Nx: int = 128
-    Ny: int = 128
-    Nz: int = 129  # Will be forced to an odd number
+    Nx: int = 64
+    Ny: int = 64
+    Nz: int = 65  # Will be forced to an odd number
 
 @dataclass
 class MembraneProps:
@@ -66,7 +66,7 @@ class MembraneProps:
 @dataclass
 class PhaseFieldParams:
     """Parameters for the phase-field model of the pore."""
-    pore_radius: float = 10e-9
+    pore_radius: float = 100e-9
     transition_thickness: float | None = None  # If None, defaults to 2*dx
 
 @dataclass

@@ -1,4 +1,4 @@
-from mempore3d import *
+from mempore3d_petsc import *
 
 Lx, Ly, Lz = 100e-9, 100e-9, 20000e-9
 Nx, Ny, Nz = 128, 128, 129  # Nz should be odd to center membrane
@@ -26,7 +26,7 @@ pore_growth_params = PhaseFieldParams(
 )
 
 high_voltage = Electrostatics(V_applied=5.0)
-thermal_params = ThermalParams(T=310, add_noise=True)
+thermal_params = None #ThermalParams(T=310, add_noise=True)
 
 print("--- Starting Simulation: Voltage-Driven Pore Expansion ---")
 simulate_membrane_charging(

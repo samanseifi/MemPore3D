@@ -1,7 +1,7 @@
 from mempore3d_petsc import *
 
 Lx, Ly, Lz = 10000e-9, 10000e-9, 20000e-9
-Nx, Ny, Nz = 64, 64, 65  # Nz should be odd to center membrane
+Nx, Ny, Nz = 64, 64, 65 # Nz should be odd to center membrane
 custom_domain = Domain(Lx=Lx, Ly=Ly, Lz=Lz, Nx=Nx, Ny=Ny, Nz=Nz)
 
 # Calculating dx for transition thickness    
@@ -13,12 +13,12 @@ solver_params = SolverParams(
     save_frames=80,
     implicit_dt_multiplier=100.0,    # A reasonable value for stability and speed.
     rebuild_vm_solver_every=25,     # Rebuild as the pore shape changes.
-    n_tau_total=8.0               # Simulate for 8x the membrane charging time.
+    n_tau_total=2.0               # Simulate for 8x the membrane charging time.
 )
 
 pore_growth_params = PhaseFieldParams(
     initial_state = 'pore',
-    initial_pore_radius=100e-9,
+    initial_pore_radius=1000e-9,
     transition_thickness=2*dx,  
     sigma_area=0,
     mobility=5.0e6,
