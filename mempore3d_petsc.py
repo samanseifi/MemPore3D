@@ -398,7 +398,7 @@ class PhaseFieldSolver:
 
         det_rhs = -self.params.mobility * (
             (self.params.line_tension / self.Cg) * (self._g_prime(psi) / self.params.transition_thickness) +
-            sigma_map * self._dH_prime(psi)
+            sigma_map * smooth_step_derivative(psi, self.params.transition_thickness)
         )
 
         if self.noise_amplitude != 0.0:
@@ -423,10 +423,26 @@ def create_grid(dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float,
     dx, dy, dz = x[1] - x[0], y[1] - y[0], z[1] - z[0]
     return x, y, z, dx, dy, dz
 
-def smooth_step(psi: np.ndarray) -> np.ndarray:
-    """Computes a cubic Hermite smooth step function H(psi)."""
+def smooth_step(x, width):
+    # 0→1 over an interval of length `width` centered at `center`
+    left = 0.5 - 0.5*width
+    s = np.clip((x - left)/width, 0.0, 1.0)         # normalize to [0,1]
+    return s**3 * (10 - 15*s + 6*s**2)
+
+def smooth_step_derivative(x, width):
+    left = 0.5 - 0.5*width
+    s = (x - left)/width
+    Hs = (30*s**2 - 60*s**3 + 30*s**4)              # dH/ds
+    out = np.zeros_like(s)
+    inside = (s >= 0) & (s <= 1)
+    out[inside] = Hs[inside] / width                # chain rule: dH/dx = (dH/ds)*(ds/dx)
+    return out
+
+
+def smooth_step_second_derivative(psi: np.ndarray, width: float) -> np.ndarray:
+    """Computes the second derivative of the smooth step function H''(psi) with respect to psi."""
     psi_clipped = np.clip(psi, 0.0, 1.0)
-    return psi_clipped**2 * (3.0 - 2.0 * psi_clipped)
+    return (60.0 * psi_clipped - 180.0 * psi_clipped**2 + 120.0 * psi_clipped**3) / width
 
 def initialize_phase_field(params: PhaseFieldParams, x: np.ndarray, y: np.ndarray) -> np.ndarray:
     """Constructs the initial phase field."""
@@ -578,7 +594,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
         if thermal.add_noise:
             G_m_map, C_m_map, C_eff_map = blend_properties_sharp(psi, props, dom)
         else:
-            H = smooth_step(psi)
+            H = smooth_step(psi, phase.transition_thickness)
             G_m_map, C_m_map, C_eff_map = blend_properties(H, props, dom)
 
         sigma_elec = 0.0
@@ -587,7 +603,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
                 if n % solver.rebuild_vm_solver_every == 0 or vm_implicit_solver is None:
                     if n > 0 and rank == 0:
                         print(f"Step {n}: Rebuilding Vm implicit solver...")
-                    H_for_solver = (psi > 0.5).astype(float) if thermal.add_noise else smooth_step(psi)
+                    H_for_solver = (psi > 0.5).astype(float) if thermal.add_noise else smooth_step(psi, phase.transition_thickness)
                     vm_implicit_solver = ImplicitVMSolver(
                         dom, C_eff_map, G_m_map, H_for_solver, dt, dx, solver.D_V, elec.sigma_e, 2*dz
                     )
@@ -614,7 +630,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
         if n % save_interval == 0 or n == nsteps - 1:
             t = (n + 1) * dt
             # Ensure psi is consistent before calculating radius on rank 0
-            eff_radius = calculate_pore_radius_simple(smooth_step(psi), dx, dy)
+            eff_radius = calculate_pore_radius_simple(smooth_step(psi, phase.transition_thickness), dx, dy)
             avg_Vm = float(np.mean(Vm)) if electrostatics_on else 0.0
 
             if rank == 0:
@@ -644,7 +660,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
                      pore_radius_vs_time, title_prefix, elapsed_time)
 
         filename = "membrane_simulation_results.npz"
-        H = smooth_step(psi)
+        H = smooth_step(psi, phase.transition_thickness)
         np.savez_compressed(
             filename, x=x, y=y, z=z, Vm=Vm, phi_elec=phi_elec_out, psi=psi, H=H,
             time_points=np.array(time_points), avg_Vm_vs_time=np.array(avg_Vm_vs_time),
