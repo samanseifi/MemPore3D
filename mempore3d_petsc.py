@@ -57,6 +57,8 @@ from scipy import fft as spfft
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import factorized
 
+from skimage.measure import find_contours
+
 # --- Physical Constants ---
 EPS0 = 8.8541878128e-12  # Vacuum permittivity, F/m
 EPS_W = 80.0 * EPS0      # Water permittivity, F/m
@@ -170,7 +172,7 @@ def build_vm_implicit_operator(dom, C_eff_map, G_m_map, H, dt, dx, D_V, sigma_e,
     """Builds the sparse matrix for the implicit Vm solve using a Numba kernel."""
     Nx, Ny = dom.Nx, dom.Ny
     base_G_sc = 2.0 * sigma_e / d
-    G_sc_map = 50.0 * base_G_sc * (1.0 - H)
+    G_sc_map = 5.0 * base_G_sc * (1.0 - H)
     G_total_map = G_m_map + G_sc_map
 
     C_eff_flat = C_eff_map.flatten(order='C')
@@ -383,13 +385,7 @@ class PhaseFieldSolver:
     def _g_prime(psi):
         return 0.5 * psi * (1.0 - psi) * (1.0 - 2.0 * psi)
 
-    @staticmethod
-    @numba.njit(cache=True)
-    def _dH_prime(psi):
-        psi_clipped = np.clip(psi, 0.0, 1.0)
-        return 6.0 * psi_clipped * (1.0 - psi_clipped)
-
-    def evolve(self, psi_in: np.ndarray, sigma_map: np.ndarray) -> np.ndarray:
+    def evolve(self, psi_in: np.ndarray, sigma_total_map: np.ndarray) -> np.ndarray:
         if self.psi_hat is None:
             self.psi_hat = spfft.rfft2(psi_in, workers=self.workers)
             psi = psi_in
@@ -398,7 +394,7 @@ class PhaseFieldSolver:
 
         det_rhs = -self.params.mobility * (
             (self.params.line_tension / self.Cg) * (self._g_prime(psi) / self.params.transition_thickness) +
-            sigma_map * smooth_step_derivative(psi, self.params.transition_thickness)
+            sigma_total_map * smooth_step_derivative(psi)
         )
 
         if self.noise_amplitude != 0.0:
@@ -423,26 +419,51 @@ def create_grid(dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float,
     dx, dy, dz = x[1] - x[0], y[1] - y[0], z[1] - z[0]
     return x, y, z, dx, dy, dz
 
-def smooth_step(x, width):
-    # 0→1 over an interval of length `width` centered at `center`
-    left = 0.5 - 0.5*width
-    s = np.clip((x - left)/width, 0.0, 1.0)         # normalize to [0,1]
-    return s**3 * (10 - 15*s + 6*s**2)
-
-def smooth_step_derivative(x, width):
-    left = 0.5 - 0.5*width
-    s = (x - left)/width
-    Hs = (30*s**2 - 60*s**3 + 30*s**4)              # dH/ds
-    out = np.zeros_like(s)
-    inside = (s >= 0) & (s <= 1)
-    out[inside] = Hs[inside] / width                # chain rule: dH/dx = (dH/ds)*(ds/dx)
-    return out
-
-
-def smooth_step_second_derivative(psi: np.ndarray, width: float) -> np.ndarray:
-    """Computes the second derivative of the smooth step function H''(psi) with respect to psi."""
+def smooth_step(psi: np.ndarray) -> np.ndarray:
+    """Computes a cubic Hermite smooth step function H(psi)."""
     psi_clipped = np.clip(psi, 0.0, 1.0)
-    return (60.0 * psi_clipped - 180.0 * psi_clipped**2 + 120.0 * psi_clipped**3) / width
+    return psi_clipped**2 * (3.0 - 2.0 * psi_clipped)
+
+def smooth_step_derivative(psi: np.ndarray) -> np.ndarray:
+    psi_clipped = np.clip(psi, 0.0, 1.0)
+    return 6.0 * psi_clipped * (1.0 - psi_clipped)
+
+# ---- single-function pore radius with smooth subcell/contour area ----
+def calculate_pore_radius(H: np.ndarray, dx: float, dy: float,
+                          level: float = 0.5, sub: int = 6) -> float:
+    """
+    r_eff = sqrt(A_pore/pi). Tries H=level contour area, else bilinear supersampling fallback.
+    """
+    try:
+        contours = find_contours(H, level=level)
+        if contours:
+            A = 0.0
+            for C in contours:
+                x = C[:, 1] * dx
+                y = C[:, 0] * dy
+                A += 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+            return np.sqrt(max(A, 0.0) / np.pi)
+    except Exception:
+        pass
+
+    ny, nx = H.shape
+    xs = (np.arange(nx * sub) + 0.5) / sub - 0.5
+    ys = (np.arange(ny * sub) + 0.5) / sub - 0.5
+    Xs, Ys = np.meshgrid(xs, ys)
+
+    x0 = np.floor(Xs).astype(int); y0 = np.floor(Ys).astype(int)
+    x1 = np.clip(x0 + 1, 0, nx - 1); y1 = np.clip(y0 + 1, 0, ny - 1)
+    x0 = np.clip(x0, 0, nx - 1);     y0 = np.clip(y0, 0, ny - 1)
+
+    Ia = H[y0, x0]; Ib = H[y0, x1]; Ic = H[y1, x0]; Id = H[y1, x1]
+    wx = Xs - x0; wy = Ys - y0
+    top = Ia * (1 - wx) + Ib * wx
+    bot = Ic * (1 - wx) + Id * wx
+    Hs = top * (1 - wy) + bot * wy
+
+    dA = (dx / sub) * (dy / sub)
+    A = float(np.sum(1.0 - Hs) * dA)
+    return np.sqrt(max(A, 0.0) / np.pi)
 
 def initialize_phase_field(params: PhaseFieldParams, x: np.ndarray, y: np.ndarray) -> np.ndarray:
     """Constructs the initial phase field."""
@@ -467,6 +488,25 @@ def blend_properties(H: np.ndarray, props: MembraneProps, dom: Domain) -> Tuple[
     C_bath = 2.0 * EPS_W / dom.Lz
     C_eff_map = C_bath + C_m_map
     return G_m_map, C_m_map, C_eff_map
+
+def blend_properties_derivative(psi: np.ndarray, props: MembraneProps, dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Blends material properties and computes their derivatives w.r.t. psi."""
+    H = smooth_step(psi)
+    dH_dpsi = smooth_step_derivative(psi)
+    
+    G_lipid, G_pore = 1.0 / props.R_lipid, 1.0 / props.R_pore
+    C_lipid, C_pore = props.C_lipid, props.C_pore
+
+    G_m_map = G_pore + (G_lipid - G_pore) * H
+    C_m_map = C_pore + (C_lipid - C_pore) * H
+    C_bath = 2.0 * EPS_W / dom.Lz
+    C_eff_map = C_bath + C_m_map
+
+    dGm_dpsi = (G_lipid - G_pore) * dH_dpsi
+    dCm_dpsi = (C_lipid - C_pore) * dH_dpsi
+    dCeff_dpsi = dCm_dpsi
+
+    return G_m_map, C_m_map, C_eff_map, dGm_dpsi, dCm_dpsi, dCeff_dpsi
 
 def blend_properties_sharp(psi: np.ndarray, props: MembraneProps, dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Blends material properties based on a sharp threshold."""
@@ -527,7 +567,7 @@ def plot_results(x, y, z, Vm, phi_elec, psi, time_points, avg_Vm_vs_time, pore_r
     fig.colorbar(im3, cax=cax3, label="Voltage (V)")
 
     ax4 = fig.add_subplot(1, 4, 4)
-    im4 = ax4.imshow(psi.T, origin="lower", extent=[x_nm[0], x_nm[-1], y_nm[0], y_nm[-1]], cmap="cividis", vmin=0, vmax=1)
+    im4 = ax4.imshow(psi.T, origin="lower", extent=[x_nm[0], x_nm[-1], y_nm[0], y_nm[-1]], cmap="jet", vmin=0, vmax=1)
     ax4.set_xlabel("x (nm)"); ax4.set_ylabel("y (nm)"); ax4.set_title("Final Pore Shape ($\\psi$)")
     cax4 = make_axes_locatable(ax4).append_axes("right", size="5%", pad=0.1)
     fig.colorbar(im4, cax=cax4, label="Phase Field")
@@ -562,8 +602,8 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     nsteps = int(np.ceil(total_time / dt))
 
     if solver.surface_diffusion and solver.D_V == 0.0:
-        solver.D_V = 0.0 # 0.05 * dx**2 / dt
-    
+        solver.D_V =0.0 # 0.05 * dx**2 / dt
+
     title_prefix = "Coupled Electrostatics & Phase-Field"
 
     if rank == 0:
@@ -593,9 +633,11 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     for n in range(nsteps):
         if thermal.add_noise:
             G_m_map, C_m_map, C_eff_map = blend_properties_sharp(psi, props, dom)
+            H = (psi > 0.5).astype(float) # Also define H for the solver
         else:
-            H = smooth_step(psi, phase.transition_thickness)
+            H = smooth_step(psi)
             G_m_map, C_m_map, C_eff_map = blend_properties(H, props, dom)
+
 
         sigma_elec = 0.0
         if electrostatics_on:
@@ -603,7 +645,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
                 if n % solver.rebuild_vm_solver_every == 0 or vm_implicit_solver is None:
                     if n > 0 and rank == 0:
                         print(f"Step {n}: Rebuilding Vm implicit solver...")
-                    H_for_solver = (psi > 0.5).astype(float) if thermal.add_noise else smooth_step(psi, phase.transition_thickness)
+                    H_for_solver = (psi > 0.5).astype(float) if thermal.add_noise else smooth_step(psi)
                     vm_implicit_solver = ImplicitVMSolver(
                         dom, C_eff_map, G_m_map, H_for_solver, dt, dx, solver.D_V, elec.sigma_e, 2*dz
                     )
@@ -618,11 +660,41 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
                 Vm = vm_implicit_solver.solve(b_rhs_2d.flatten(order='C'))
                 
             Vm = comm.bcast(Vm if rank == 0 else None, root=0)
-            sigma_elec = 0.5 * C_m_map * (Vm**2)
             
+        # ==================================================================
+        # --- IMPLEMENTATION OF THE NON-LOCAL P_elec MODEL (THE FIX) ---
+        # ==================================================================
+        P_elec = 0.0
+        if electrostatics_on and rank == 0:
+            # 1. Calculate the local electrical energy density
+            # Use the blended C_m_map, which is consistent with the Vm solve
+            sigma_elec_density = 0.5 * C_m_map * (Vm**2)
+            
+            # 2. Calculate the average energy density over the LIPID area
+            # The H map correctly identifies the lipid region
+            lipid_area = np.sum(H)
+            
+            # Avoid division by zero if the entire membrane pores
+            if lipid_area > 1e-6:
+                # Numerator is the total energy stored in the lipid
+                total_lipid_energy = np.sum(sigma_elec_density * H)
+                # P_elec is the average energy density on the lipid
+                P_elec = total_lipid_energy / lipid_area
+            else:
+                P_elec = 0.0
+        # ==================================================================
+            
+
+        # sigma_elec_force_density = 0.0 # This is a tension (J/m^2), not a force (J/m^3)        
+        # if electrostatics_on and rank == 0:
+        #     # Calculate the derivative of Cm w.r.t. H
+        #     dCm_dH = (props.C_lipid - props.C_pore)
+        #     # The electrical tension is 0.5 * dCm/dH * Vm^2
+        #     sigma_elec_force_density = 0.5 * dCm_dH * (Vm**2)
         if phase_field_on:
-            sigma_total_map = phase.sigma_area + sigma_elec
             if rank == 0:
+                # Combine the constant tension with the electrical tension
+                sigma_total_map = phase.sigma_area + P_elec
                 psi = phase_field_solver.evolve(psi, sigma_total_map)
             # Broadcast the updated phase field to all processes to ensure consistency
             psi = comm.bcast(psi, root=0)
@@ -630,7 +702,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
         if n % save_interval == 0 or n == nsteps - 1:
             t = (n + 1) * dt
             # Ensure psi is consistent before calculating radius on rank 0
-            eff_radius = calculate_pore_radius_simple(smooth_step(psi, phase.transition_thickness), dx, dy)
+            eff_radius = calculate_pore_radius(smooth_step(psi), dx, dy)
             avg_Vm = float(np.mean(Vm)) if electrostatics_on else 0.0
             avg_sigma = float(np.mean(sigma_elec))
 
@@ -638,7 +710,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
                 time_points.append(t)
                 avg_Vm_vs_time.append(avg_Vm)
                 pore_radius_vs_time.append(eff_radius)
-                print(f"Time: {t*1e9:8.2f} ns [{n+1:>{len(str(nsteps))}}/{nsteps}] | Avg Vm: {avg_Vm:.4f} V | Avg Sigma: {avg_sigma:.4f} J/m^2 | Pore R: {eff_radius*1e9:.2f} nm")
+                print(f"Time: {t*1e9:8.2f} ns [{n+1:>{len(str(nsteps))}}/{nsteps}] | Avg Vm: {avg_Vm:.4f} V | P_elec: {P_elec:.4f} J/m^2 | Pore R: {eff_radius*1e9:.2f} nm")
 
     # --- Output Results ---
     # Final state is already synchronized from the last loop iteration
@@ -661,7 +733,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
                      pore_radius_vs_time, title_prefix, elapsed_time)
 
         filename = "membrane_simulation_results.npz"
-        H = smooth_step(psi, phase.transition_thickness)
+        H = smooth_step(psi)
         np.savez_compressed(
             filename, x=x, y=y, z=z, Vm=Vm, phi_elec=phi_elec_out, psi=psi, H=H,
             time_points=np.array(time_points), avg_Vm_vs_time=np.array(avg_Vm_vs_time),
