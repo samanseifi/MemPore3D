@@ -1,0 +1,18 @@
+name: petsc-mpi
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy[version='<2']
+  - petsc
+  - petsc4py
+  - mpi4py
+  - openmpi
+  - matplotlib-base[version='>=3.7,<3.9']
+  - ca-certificates
+  - openssl
+  - numba[version='>=0.59,<0.61']
+  - llvmlite[version='>=0.42,<0.43']
+  - certifi
+  - scipy[version='>=1.10,<1.14']
+  - mpi4py-fft
