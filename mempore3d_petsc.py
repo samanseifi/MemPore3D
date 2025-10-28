@@ -666,25 +666,24 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
         # ==================================================================
         P_elec = 0.0
         if electrostatics_on and rank == 0:
-            # 1. Define the pure material capacitances from the 1D Abidor model.
-            C_lipid = props.C_lipid  # Capacitance of pure lipid
-            C_pore = props.C_pore    # Capacitance of pure water/pore
+            # 1. Define the pure lipid capacitance.
+            C_lipid = props.C_lipid
             
-            # 2. Calculate the local energy-replacement density.
-            # This is the physical driving force: 0.5 * (C_pore - C_lipid) * Vm(r)^2
-            energy_replacement_density = 0.5 * (C_pore - C_lipid) * (Vm**2)
+            # 2. Calculate the local Maxwell stress (energy density) in the lipid.
+            # This is the physical driving force: 0.5 * C_lipid * Vm(r)^2
+            maxwell_energy_density = 0.5 * C_lipid * (Vm**2)
             
             # 3. Calculate the average energy density over the LIPID area.
-            # H(phi) now correctly acts as a spatial mask for the lipid region.
+            # H(phi) acts as a spatial mask for the lipid region.
             lipid_area = np.sum(H)
             
-            # Avoid division by zero if the entire membrane pores
+            # Avoid division by zero
             if lipid_area > 1e-6:
-                # Numerator is the total driving energy (integral over lipid)
-                total_driving_energy = np.sum(energy_replacement_density * H)
+                # Numerator is the total energy stored in the lipid
+                total_lipid_energy = np.sum(maxwell_energy_density * H)
                 
                 # P_elec is the non-local, spatially-uniform electrical pressure
-                P_elec = total_driving_energy / lipid_area
+                P_elec = total_lipid_energy / lipid_area
             else:
                 P_elec = 0.0
         # ==================================================================
