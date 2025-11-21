@@ -205,6 +205,6 @@ def main(filepath: str):
     print("\n✅ All plots generated and calculations completed successfully.")
 
 
-npz_filepath = "membrane_simulation_results.npz"
+npz_filepath = "membrane_simulation_results_v0.npz"
 
 main(npz_filepath)
