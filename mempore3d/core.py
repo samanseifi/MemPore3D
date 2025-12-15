@@ -265,14 +265,7 @@ def create_grid(dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float,
     dx, dy, dz = x[1] - x[0], y[1] - y[0], z[1] - z[0]
     return x, y, z, dx, dy, dz
 
-def smooth_step(psi: np.ndarray) -> np.ndarray:
-    """Computes a cubic Hermite smooth step function H(psi)."""
-    psi_clipped = np.clip(psi, 0.0, 1.0)
-    return psi_clipped**2 * (3.0 - 2.0 * psi_clipped)
 
-def smooth_step_derivative(psi: np.ndarray) -> np.ndarray:
-    psi_clipped = np.clip(psi, 0.0, 1.0)
-    return 6.0 * psi_clipped * (1.0 - psi_clipped)
 
 # ---- single-function pore radius with smooth subcell/contour area ----
 def calculate_pore_radius(H: np.ndarray, dx: float, dy: float,

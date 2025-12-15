@@ -4,6 +4,8 @@ from petsc4py import PETSc
 import numpy as np
 from scipy import fft as spfft
 
+import numba
+
 
 class PETScPoissonGAMG:
     def __init__(self, Nx, Ny, Nz, dx, dy, dz):
@@ -257,9 +259,9 @@ class SpectralPoissonSolver:
                     lambda_k = np.sqrt(self.lambda2[ikx, iky])
 
                     # Region 1: z ∈ [0, k_mem_minus]
-                    self._solve_region_analytical(
+                    _solve_region_analytical(
                         phi_hat, ikx, iky, lambda_k,
-                        z_start=0, z_end=self.k_mem_minus,
+                        z_start=0, z_end=self.k_mem_minus, dz=self.dz,
                         phi_left=bc_z0_hat[ikx, iky],
                         phi_right=bc_km_hat[ikx, iky]
                     )
@@ -273,9 +275,9 @@ class SpectralPoissonSolver:
                             (1 - alpha) * bc_km_hat[ikx, iky] + alpha * bc_kp_hat[ikx, iky]
 
                     # Region 3: z ∈ [k_mem_plus, Nz-1]
-                    self._solve_region_analytical(
+                    _solve_region_analytical(
                         phi_hat, ikx, iky, lambda_k,
-                        z_start=self.k_mem_plus, z_end=self.Nz - 1,
+                        z_start=self.k_mem_plus, z_end=self.Nz - 1, dz=self.dz,
                         phi_left=bc_kp_hat[ikx, iky],
                         phi_right=bc_z1_hat[ikx, iky]
                     )
@@ -288,51 +290,6 @@ class SpectralPoissonSolver:
         self.phi = self.comm.bcast(self.phi, root=0)
 
         return self
-
-    def _solve_region_analytical(self, phi_hat, ikx, iky, lambda_k,
-                                 z_start, z_end, phi_left, phi_right):
-        """
-        Solve 1D Helmholtz eq: d^2 phi / dz^2 - lambda^2 phi = 0
-        Using numerically stable formulation for large lambda.
-        """
-        # Create local coordinate system
-        n_points = z_end - z_start + 1
-        z_local = np.arange(n_points) * self.dz
-        L_region = (n_points - 1) * self.dz
-        
-        # Select the slice of the solution array we are writing to
-        # (This avoids the slow Python loop 'for iz in range...')
-        sol_slice = phi_hat[ikx, iky, z_start : z_end + 1]
-
-        # Case 1: Zero frequency (Linear interpolation)
-        if lambda_k < 1e-12:
-            alpha = z_local / L_region
-            sol_slice[:] = (1.0 - alpha) * phi_left + alpha * phi_right
-            return
-
-        # Case 2: High frequency (Numerically Stable Formulation)
-        # Formula: phi(z) = phi_L * sinh(lam*(L-z))/sinh(lam*L) + phi_R * sinh(lam*z)/sinh(lam*L)
-        
-        # Check for potential overflow in sinh (limit is ~709 for float64)
-        # For a 10um box, lambda can get high, but usually < 700 with standard grids.
-        # If lambda_k * L_region > 700, we should use exp formulation, 
-        # but standard np.sinh handles up to ~10^300, so checking for 'inf' is usually enough.
-        
-        arg_L = lambda_k * L_region
-        
-        # If argument is too large, use asymptotic approximation to avoid Inf/NaN
-        if arg_L > 700: 
-            # approximate sinh(x) ~ exp(x)/2
-            # ratio sinh(lam*(L-z)) / sinh(lam*L) ~ exp(-lam*z)
-            term1 = phi_left * np.exp(-lambda_k * z_local)
-            # ratio sinh(lam*z) / sinh(lam*L) ~ exp(-lam*(L-z))
-            term2 = phi_right * np.exp(-lambda_k * (L_region - z_local))
-            sol_slice[:] = term1 + term2
-        else:
-            denom = np.sinh(arg_L)
-            term1 = phi_left * np.sinh(lambda_k * (L_region - z_local)) / denom
-            term2 = phi_right * np.sinh(lambda_k * z_local) / denom
-            sol_slice[:] = term1 + term2
 
     def current_slice_kplus_minus(self, dz, sigma_e):
         """
@@ -352,3 +309,49 @@ class SpectralPoissonSolver:
             return sigma_e * (grad_plus + grad_minus)
         else:
             return None
+        
+@numba.njit(cache=True, fastmath=True)
+def _solve_region_analytical(phi_hat, ikx, iky, lambda_k,
+                                z_start, z_end, dz, phi_left, phi_right):
+    """
+    Solve 1D Helmholtz eq: d^2 phi / dz^2 - lambda^2 phi = 0
+    Using numerically stable formulation for large lambda.
+    """
+    # Create local coordinate system
+    n_points = z_end - z_start + 1
+    z_local = np.arange(n_points) * dz
+    L_region = (n_points - 1) * dz
+    
+    # Select the slice of the solution array we are writing to
+    # (This avoids the slow Python loop 'for iz in range...')
+    sol_slice = phi_hat[ikx, iky, z_start : z_end + 1]
+
+    # Case 1: Zero frequency (Linear interpolation)
+    if lambda_k < 1e-12:
+        alpha = z_local / L_region
+        sol_slice[:] = (1.0 - alpha) * phi_left + alpha * phi_right
+        return
+
+    # Case 2: High frequency (Numerically Stable Formulation)
+    # Formula: phi(z) = phi_L * sinh(lam*(L-z))/sinh(lam*L) + phi_R * sinh(lam*z)/sinh(lam*L)
+    
+    # Check for potential overflow in sinh (limit is ~709 for float64)
+    # For a 10um box, lambda can get high, but usually < 700 with standard grids.
+    # If lambda_k * L_region > 700, we should use exp formulation, 
+    # but standard np.sinh handles up to ~10^300, so checking for 'inf' is usually enough.
+    
+    arg_L = lambda_k * L_region
+    
+    # If argument is too large, use asymptotic approximation to avoid Inf/NaN
+    if arg_L > 700: 
+        # approximate sinh(x) ~ exp(x)/2
+        # ratio sinh(lam*(L-z)) / sinh(lam*L) ~ exp(-lam*z)
+        term1 = phi_left * np.exp(-lambda_k * z_local)
+        # ratio sinh(lam*z) / sinh(lam*L) ~ exp(-lam*(L-z))
+        term2 = phi_right * np.exp(-lambda_k * (L_region - z_local))
+        sol_slice[:] = term1 + term2
+    else:
+        denom = np.sinh(arg_L)
+        term1 = phi_left * np.sinh(lambda_k * (L_region - z_local)) / denom
+        term2 = phi_right * np.sinh(lambda_k * z_local) / denom
+        sol_slice[:] = term1 + term2
