@@ -1,4 +1,4 @@
-from mempore3d_petsc import *
+from mempore3d.core import *
 
 Lx, Ly, Lz = 1000e-9, 1000e-9, 2000e-9
 Nx, Ny, Nz = 128, 128, 129  # Nz should be odd to center membrane
