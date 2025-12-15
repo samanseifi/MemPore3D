@@ -90,3 +90,6 @@ Desktop.ini
 *.orig
 *.npz
 *.npy
+
+# not results
+results/
