@@ -82,3 +82,12 @@ class PhaseFieldSolver:
         psi_new = spfft.irfft2(self.psi_hat, s=psi.shape, workers=self.workers).real
         np.clip(psi_new, 0.0, 1.0, out=psi_new)
         return psi_new
+    
+def smooth_step(psi: np.ndarray) -> np.ndarray:
+    """Computes a cubic Hermite smooth step function H(psi)."""
+    psi_clipped = np.clip(psi, 0.0, 1.0)
+    return psi_clipped**2 * (3.0 - 2.0 * psi_clipped)
+
+def smooth_step_derivative(psi: np.ndarray) -> np.ndarray:
+    psi_clipped = np.clip(psi, 0.0, 1.0)
+    return 6.0 * psi_clipped * (1.0 - psi_clipped)

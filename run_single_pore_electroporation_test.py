@@ -1,4 +1,6 @@
-from mempore3d.core import *
+from mempore3d.parameters import *
+from mempore3d.core import simulate_membrane_charging
+import numpy as np
 
 Lx, Ly, Lz = 100e-9, 100e-9, 20000e-9
 Nx, Ny, Nz = 128, 128, 129  # Nz should be odd to center membrane
@@ -13,7 +15,8 @@ solver_params = SolverParams(
     save_frames=80,
     implicit_dt_multiplier=100.0,    # A reasonable value for stability and speed.
     rebuild_vm_solver_every=15,     # Rebuild as the pore shape changes.
-    n_tau_total=50.0               # Simulate for 8x the membrane charging time.
+    n_tau_total=50.0,              # Simulate for 8x the membrane charging time.
+    poisson_solver='spectral'
 )
 
 pore_growth_params = PhaseFieldParams(
