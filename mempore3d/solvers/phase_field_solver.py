@@ -66,15 +66,25 @@ class PhaseFieldSolver:
         else:
             psi = spfft.irfft2(self.psi_hat, s=psi_in.shape, workers=self.workers).real
 
+        # Deterministic parts
         det_rhs = -self.params.mobility * (
             (self.params.line_tension / self.Cg) * (self._g_prime(psi) / self.params.transition_thickness) +
             sigma_total_map * smooth_step_derivative(psi)
         )
 
+        # --- CORRECTION STARTS HERE ---
         if self.noise_amplitude != 0.0:
-            self._rhs_real[:] = det_rhs + self.noise_amplitude * np.random.randn(*psi.shape)
+            # Generate raw noise
+            raw_noise = self.noise_amplitude * np.random.randn(*psi.shape)
+            
+            # Mask noise so it only applies where psi ~ 1 (Lipid)
+            # Using smooth_step ensures a smooth transition at the interface
+            masked_noise = raw_noise * smooth_step(psi) 
+            
+            self._rhs_real[:] = det_rhs + masked_noise
         else:
             self._rhs_real[:] = det_rhs
+        # --- CORRECTION ENDS HERE ---
 
         rhs_hat = spfft.rfft2(self._rhs_real, workers=self.workers)
         self.psi_hat = (self.psi_hat + self.dt * rhs_hat) / self.denom

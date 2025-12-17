@@ -28,8 +28,8 @@ pore_growth_params = PhaseFieldParams(
     evolve='on'
 )
 
-high_voltage = Electrostatics(V_applied=1.5)
-thermal_params = ThermalParams(T=310, add_noise=True)
+high_voltage = Electrostatics(V_applied=2.5)
+thermal_params = ThermalParams(T=400, add_noise=True)
 
 print("--- Starting Simulation: Voltage-Driven Pore Expansion ---")
 simulate_membrane_charging(

@@ -93,60 +93,53 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
     nsteps = int(np.ceil(total_time / dt))
 
     if solver.surface_diffusion and solver.D_V == 0.0:
-        solver.D_V =0.0 # 0.05 * dx**2 / dt
+        solver.D_V = 0.0 
 
-    title_prefix = "Coupled Electrostatics & Phase-Field"
-
+    # --- Setup Output Directory ---
+    output_dir = "simulation_results"
     if rank == 0:
-        print(f"\n--- {title_prefix} ---")
-        print(f"Grid: {dom.Nx}x{dom.Ny}x{dom.Nz} (dx={dx*1e9:.2f} nm)")
-        tau_report = total_time / solver.n_tau_total
-        print(f"System Time Constant (τ_lipid): {tau_report*1e9:.2f} ns")
-        print(f"Total Sim Time: {total_time*1e6:.2f} µs ({solver.n_tau_total:.1f} τ_lipid)")
-        print(f"Time step (dt): {dt*1e9:.3f} ns | Total steps: {nsteps}")
-        if electrostatics_on:
-            print(f"Vm solver will be rebuilt every {solver.rebuild_vm_solver_every} steps.")
-        print(f"Phase-field evolution enabled: {phase_field_on}")
-        if phase_field_on:
-            print(f"Thermal noise enabled: {thermal.add_noise} at T = {thermal.T} K")
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        print(f"\n--- Coupled Electrostatics & Phase-Field ---")
+        print(f"Grid: {dom.Nx}x{dom.Ny}x{dom.Nz}")
+        print(f"Saving output every {solver.save_frames} frames to '{output_dir}/'")
         print("-" * 60)
 
-    # --- Initialize Solvers (on all ranks as needed) ---
+    # --- Initialize Solvers ---
     psi = initialize_phase_field(phase, x, y)
     phase_field_solver = PhaseFieldSolver(dom, phase, thermal, dx, dt, workers=os.cpu_count()) if phase_field_on else None
 
-    # Select Poisson solver based on user choice
     if electrostatics_on:
         if solver.poisson_solver == 'spectral':
             poisson = SpectralPoissonSolver(dom.Nx, dom.Ny, dom.Nz, dx, dy, dz)
         elif solver.poisson_solver == 'gamg_petsc':
             poisson = PETScPoissonGAMG(dom.Nx, dom.Ny, dom.Nz, dx, dy, dz)
         else:
-            raise ValueError(f"Unknown poisson_solver: '{solver.poisson_solver}'. Use 'spectral' or 'gamg'.")
+            raise ValueError(f"Unknown poisson_solver: '{solver.poisson_solver}'")
     else:
         poisson = None
 
     vm_implicit_solver = None
-
     Vm = np.zeros((dom.Nx, dom.Ny), dtype=float)
+    
+    # Store history for the FINAL summary plot (optional, or you can save incrementally)
     time_points, avg_Vm_vs_time, pore_radius_vs_time = [], [], []
     save_interval = max(1, nsteps // solver.save_frames)
 
+    # --- Main Time Loop ---
     for n in range(nsteps):
         if thermal.add_noise:
+            # Note: Ensure you use the "masked noise" fix discussed previously here inside the solver!
+            H = (psi > 0.5).astype(float) 
             G_m_map, C_m_map, C_eff_map = blend_properties_sharp(psi, props, dom)
-            H = (psi > 0.5).astype(float) # Also define H for the solver
         else:
             H = smooth_step(psi)
             G_m_map, C_m_map, C_eff_map = blend_properties(H, props, dom)
 
-
-        sigma_elec = 0.0
+        # 1. Update Electrostatics
         if electrostatics_on:
             if rank == 0:
                 if n % solver.rebuild_vm_solver_every == 0 or vm_implicit_solver is None:
-                    if n > 0 and rank == 0:
-                        print(f"Step {n}: Rebuilding Vm implicit solver...")
                     H_for_solver = (psi > 0.5).astype(float) if thermal.add_noise else smooth_step(psi)
                     vm_implicit_solver = ImplicitVMSolver(
                         dom, C_eff_map, G_m_map, H_for_solver, dt, dx, solver.D_V, elec.sigma_e, 2*dz
@@ -162,99 +155,82 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
                 Vm = vm_implicit_solver.solve(b_rhs_2d.flatten(order='C'))
                 
             Vm = comm.bcast(Vm if rank == 0 else None, root=0)
-            
-        # ==================================================================
-        # --- IMPLEMENTATION OF THE NON-LOCAL P_elec MODEL (THE FIX) ---
-        # ==================================================================
+
+        # 2. Update Phase Field (Pore Growth)
         P_elec = 0.0
         if electrostatics_on and rank == 0:
-            # 1. Define the pure lipid capacitance.
             C_lipid = props.C_lipid
-            
-            # 2. Calculate the local Maxwell stress (energy density) in the lipid.
-            # This is the physical driving force: 0.5 * C_lipid * Vm(r)^2
             maxwell_energy_density = 0.5 * C_lipid * (Vm**2)
-            
-            # 3. Calculate the average energy density over the LIPID area.
-            # H(phi) acts as a spatial mask for the lipid region.
             lipid_area = np.sum(H)
-            
-            # Avoid division by zero
             if lipid_area > 1e-6:
-                # Numerator is the total energy stored in the lipid
-                total_lipid_energy = np.sum(maxwell_energy_density * H)
-                
-                # P_elec is the non-local, spatially-uniform electrical pressure
-                P_elec = total_lipid_energy / lipid_area
-            else:
-                P_elec = 0.0
-        # ==================================================================
-            
+                P_elec = np.sum(maxwell_energy_density * H) / lipid_area
 
-        # sigma_elec_force_density = 0.0 # This is a tension (J/m^2), not a force (J/m^3)        
-        # if electrostatics_on and rank == 0:
-        #     # Calculate the derivative of Cm w.r.t. H
-        #     dCm_dH = (props.C_lipid - props.C_pore)
-        #     # The electrical tension is 0.5 * dCm/dH * Vm^2
-        #     sigma_elec_force_density = 0.5 * dCm_dH * (Vm**2)
         if phase_field_on:
             if rank == 0:
-                # Combine the constant tension with the electrical tension
                 sigma_total_map = phase.sigma_area + P_elec
                 psi = phase_field_solver.evolve(psi, sigma_total_map)
-            # Broadcast the updated phase field to all processes to ensure consistency
             psi = comm.bcast(psi, root=0)
         
+        # 3. Checkpointing / Saving Data
         if n % save_interval == 0 or n == nsteps - 1:
             t = (n + 1) * dt
-            # Ensure psi is consistent before calculating radius on rank 0
+            
+            # --- Gather 3D Potential Field (phi) ---
+            # We do this inside the loop now so we can save it to disk
+            phi_elec_out = None
+            if electrostatics_on:
+                if isinstance(poisson, SpectralPoissonSolver):
+                    phi_elec_out = poisson.phi if rank == 0 else None
+                else:
+                    # GAMG / PETSc Scatter
+                    scat, phi_vec = PETSc.Scatter.toZero(poisson.x)
+                    scat.begin(poisson.x, phi_vec, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+                    scat.end(poisson.x, phi_vec, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+                    if rank == 0:
+                        phi_arr = phi_vec.getArray(readonly=True)
+                        phi_elec_out = phi_arr.reshape(dom.Nz, dom.Ny, dom.Nx).transpose(2,1,0)
+                    scat.destroy() # Clean up scatter context
+            else:
+                phi_elec_out = np.zeros((dom.Nx, dom.Ny, dom.Nz)) if rank == 0 else None
+
+            # --- Save to Disk (Rank 0 only) ---
             eff_radius = calculate_pore_radius(smooth_step(psi), dx, dy)
             avg_Vm = float(np.mean(Vm)) if electrostatics_on else 0.0
-            avg_sigma = float(np.mean(sigma_elec))
-
+            
             if rank == 0:
                 time_points.append(t)
                 avg_Vm_vs_time.append(avg_Vm)
                 pore_radius_vs_time.append(eff_radius)
-                print(f"Time: {t*1e9:8.2f} ns [{n+1:>{len(str(nsteps))}}/{nsteps}] | Avg Vm: {avg_Vm:.4f} V | P_elec: {P_elec:.4f} J/m^2 | Pore R: {eff_radius*1e9:.2f} nm")
-
-    # --- Output Results ---
-    # Final state is already synchronized from the last loop iteration
-    if electrostatics_on:
-        # Handle different solver types
-        if isinstance(poisson, SpectralPoissonSolver):
-            # Spectral solver already has phi in numpy format
-            phi_elec_out = poisson.phi if rank == 0 else None
-        else:
-            # GAMG solver uses PETSc vectors
-            scat, phi_vec = PETSc.Scatter.toZero(poisson.x)
-            scat.begin(poisson.x, phi_vec, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
-            scat.end  (poisson.x, phi_vec, addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
-            scat.destroy()
-            if rank == 0:
-                phi_arr = phi_vec.getArray(readonly=True)
-                phi_elec_out = phi_arr.reshape(dom.Nz, dom.Ny, dom.Nx).transpose(2,1,0)
-    else:
-        phi_elec_out = np.zeros((dom.Nx, dom.Ny, dom.Nz)) if rank == 0 else None
+                
+                print(f"Time: {t*1e9:8.2f} ns | Avg Vm: {avg_Vm:.4f} V | Pore R: {eff_radius*1e9:.2f} nm | Saving...")
+                
+                # Save numbered file
+                filename = f"{output_dir}/step_{n:06d}.npz"
+                np.savez_compressed(
+                    filename, 
+                    x=x, y=y, z=z, 
+                    Vm=Vm, 
+                    phi_elec=phi_elec_out, 
+                    psi=psi, 
+                    H=smooth_step(psi),
+                    time=t,
+                    avg_Vm=avg_Vm,
+                    pore_radius=eff_radius
+                )
+            
+            # Sync before continuing to ensure file I/O doesn't cause race conditions
+            comm.Barrier()
 
     elapsed_time = time.time() - start_time
-
     if rank == 0:
         print(f"\nSimulation finished in {elapsed_time:.2f} seconds.")
-        plot_results(x, y, z, Vm, phi_elec_out, psi, time_points, avg_Vm_vs_time,
-                     pore_radius_vs_time, title_prefix, elapsed_time)
-
-        filename = "membrane_simulation_results.npz"
-        H = smooth_step(psi)
+        # Optional: Save a final summary file with full time histories
         np.savez_compressed(
-            filename, x=x, y=y, z=z, Vm=Vm, phi_elec=phi_elec_out, psi=psi, H=H,
-            time_points=np.array(time_points), avg_Vm_vs_time=np.array(avg_Vm_vs_time),
-            pore_radius_vs_time=np.array(pore_radius_vs_time),
-            domain_params=dom, props_params=props, phase_params=phase,
-            elec_params=elec, solver_params=solver, thermal_params=thermal
+            f"{output_dir}/summary_history.npz",
+            time_points=np.array(time_points),
+            avg_Vm_vs_time=np.array(avg_Vm_vs_time),
+            pore_radius_vs_time=np.array(pore_radius_vs_time)
         )
-        print(f"Numerical results saved to {filename}")
-    comm.Barrier()
 
 def create_grid(dom: Domain) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     """Creates the computational grid."""
