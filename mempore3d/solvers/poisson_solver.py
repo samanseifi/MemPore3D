@@ -305,8 +305,12 @@ class SpectralPoissonSolver:
             # Finite difference gradients
             grad_plus = (self.phi[:, :, k_plus + 1] - self.phi[:, :, k_plus]) / dz
             grad_minus = (self.phi[:, :, k_minus] - self.phi[:, :, k_minus - 1]) / dz
+            dphidz_plus  = (-3*self.phi[:,:,k_plus]  + 4*self.phi[:,:,k_plus+1]  - self.phi[:,:,k_plus+2]) /(2*dz)
+            dphidz_minus = ( 3*self.phi[:,:,k_minus] - 4*self.phi[:,:,k_minus-1] + self.phi[:,:,k_minus-2])/(2*dz)
+            J = sigma_e * (dphidz_plus + dphidz_minus)
 
-            return sigma_e * (grad_plus + grad_minus)
+            
+            return J
         else:
             return None
         
