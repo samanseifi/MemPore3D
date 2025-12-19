@@ -2,7 +2,7 @@ from mempore3d.parameters import *
 from mempore3d.core import *
 
 Lx, Ly, Lz = 10000e-9, 10000e-9, 20000e-9
-Nx, Ny, Nz = 64, 64, 65 # Nz should be odd to center membrane
+Nx, Ny, Nz = 64, 64, 513 # Nz should be odd to center membrane
 custom_domain = Domain(Lx=Lx, Ly=Ly, Lz=Lz, Nx=Nx, Ny=Ny, Nz=Nz)
 
 # Calculating dx for transition thickness    
@@ -39,3 +39,12 @@ simulate_membrane_charging(
     elec=high_voltage,
     thermal=thermal_params
 )
+
+# 64x64x33 I_pore = -1632.6073
+# 64x64x65 I_pore = -1879.0068   
+# 64x64x129 I_pore = -2060.2093
+# 64x64x257 I_pore = -2207.6311
+# 64x64x513 I_pore = -2337.6513
+
+
+ 
