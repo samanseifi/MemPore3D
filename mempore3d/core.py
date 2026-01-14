@@ -142,8 +142,9 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
                 if n % solver.rebuild_vm_solver_every == 0 or vm_implicit_solver is None:
                     H_for_solver = (psi > 0.5).astype(float) if thermal.add_noise else smooth_step(psi)
                     vm_implicit_solver = ImplicitVMSolver(
-                        dom, C_eff_map, G_m_map, H_for_solver, dt, dx, solver.D_V, elec.sigma_e, 2*dz
+                        dom, C_eff_map, G_m_map, H_for_solver, dt, dx, solver.D_V, elec.sigma_e, 1e-8
                     )
+                   
             
             Vm = comm.bcast(Vm if rank == 0 else None, root=0)
             poisson.apply_dirichlet_planes(Vm, elec.V_applied)

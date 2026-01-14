@@ -196,11 +196,13 @@ def calculate_J_from_phi_inplace(J_out, phi, k_plane_index, sigma_e, dz):
     k = k_plane_index
     if k < 0 or k + 1 >= Nz:
         raise ValueError("k_plane_index out of bounds for phi.shape[2].")
-
-    scale = sigma_e / dz
+    
+    scale = sigma_e / (2*dz)
     for j in range(Ny):
         for i in range(Nx):
-            J_out[j, i] = scale * (phi[j, i, k + 1] - phi[j, i, k])
+            dphidz_plus = (-3*phi[:,:,k+1]  + 4*phi[:,:,k+2]  - phi[:,:,k+3])
+            dphidz_minus = ( 3*phi[:,:,k-1] - 4*phi[:,:,k-2] + phi[:,:,k-3])
+            J_out[j, i] = scale * (dphidz_plus + dphidz_minus)
 
 
 def calculate_J_from_phi(phi: np.ndarray, k_plane_index: int, sigma_e: float, dz: float,

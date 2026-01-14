@@ -144,214 +144,353 @@ class PETScPoissonGAMG:
             return None
         
         
+# class SpectralPoissonSolver_old:
+#     """
+#     Fast spectral 3D Poisson/Laplace solver using:
+#     - DCT-II in X and Y directions (for Neumann BCs)
+#     - Analytical solution in Z direction (for Dirichlet BCs)
+
+#     This solver is ~10-50x faster than iterative GAMG for this geometry.
+#     It provides a drop-in replacement for PETScPoissonGAMG.
+
+#     Boundary Conditions:
+#     - X, Y: Homogeneous Neumann (∂φ/∂n = 0)
+#     - Z: Non-homogeneous Dirichlet at 4 planes:
+#         * z=0: φ = -0.5*V_applied
+#         * z=k_mem_minus: φ = -0.5*Vm[i,j]
+#         * z=k_mem_plus: φ = +0.5*Vm[i,j]
+#         * z=Nz-1: φ = +0.5*V_applied
+
+#     The domain is split into 3 Z-regions, and each is solved analytically
+#     in spectral space using sinh/cosh basis functions.
+#     """
+#     def __init__(self, Nx, Ny, Nz, dx, dy, dz):
+#         self.Nx, self.Ny = Nx, Ny
+#         self.Nz = Nz if Nz % 2 else Nz + 1
+#         self.dx, self.dy, self.dz = dx, dy, dz
+
+#         # Membrane plane indices
+#         self.k_mem_minus = self.Nz // 2 - 1
+#         self.k_mem_plus = self.Nz // 2 + 1
+
+#         # Precompute wavenumbers for DCT-II (Neumann BCs)
+#         # For Neumann BCs with DCT-II: k_n = π*n/L, n=0,1,2,...
+#         kx = np.arange(Nx)
+#         ky = np.arange(Ny)
+#         Lx, Ly = Nx * dx, Ny * dy
+
+#         lambda_x = np.pi * kx / Lx
+#         lambda_y = np.pi * ky / Ly
+
+#         # Create 2D grid of eigenvalues
+#         self.lambda2 = lambda_x[:, np.newaxis]**2 + lambda_y[np.newaxis, :]**2
+
+#         # Storage for solution
+#         self.phi = np.zeros((Nx, Ny, Nz), dtype=np.float64)
+
+#         # Boundary condition storage
+#         self.bc_z0 = None
+#         self.bc_z1 = None
+#         self.bc_km = None
+#         self.bc_kp = None
+
+#         # For compatibility with PETSc interface
+#         self.comm = MPI.COMM_WORLD
+#         self.rank = self.comm.Get_rank()
+
+#         # Warning: This is a serial solver (runs on rank 0 only)
+#         if self.rank == 0:
+#             print("INFO: Using SpectralPoissonSolver (serial, runs on rank 0 only)")
+
+#     def apply_dirichlet_planes(self, Vm, V_applied):
+#         """Set boundary conditions (same interface as PETScPoissonGAMG)."""
+#         if self.rank == 0:
+#             self.bc_z0 = -0.5 * V_applied * np.ones((self.Nx, self.Ny))
+#             self.bc_z1 = +0.5 * V_applied * np.ones((self.Nx, self.Ny))
+
+#             if Vm is not None:
+#                 self.bc_km = -0.5 * Vm.copy()
+#                 self.bc_kp = +0.5 * Vm.copy()
+#             else:
+#                 self.bc_km = np.zeros((self.Nx, self.Ny))
+#                 self.bc_kp = np.zeros((self.Nx, self.Ny))
+
+#         # Broadcast to all ranks for consistency
+#         self.bc_z0 = self.comm.bcast(self.bc_z0, root=0)
+#         self.bc_z1 = self.comm.bcast(self.bc_z1, root=0)
+#         self.bc_km = self.comm.bcast(self.bc_km, root=0)
+#         self.bc_kp = self.comm.bcast(self.bc_kp, root=0)
+
+#     def solve(self):
+#         """
+#         Solve the 3D Laplace equation ∇²φ = 0 using spectral methods.
+
+#         Strategy:
+#         1. Apply 2D DCT in X-Y plane to boundary conditions
+#         2. For each (kx, ky) mode, solve analytically in Z direction
+#         3. Apply inverse 2D DCT to get physical space solution
+
+#         The Z-direction is divided into 3 regions:
+#         - Region 1: [0, k_mem_minus]
+#         - Region 2: [k_mem_minus, k_mem_plus] (membrane, linear interpolation)
+#         - Region 3: [k_mem_plus, Nz-1]
+
+#         Returns: self (for compatibility with PETSc interface)
+#         """
+#         if self.rank == 0:
+#             # Transform boundary conditions to spectral space
+#             bc_z0_hat = spfft.dctn(self.bc_z0, type=2, norm='ortho')
+#             bc_z1_hat = spfft.dctn(self.bc_z1, type=2, norm='ortho')
+#             bc_km_hat = spfft.dctn(self.bc_km, type=2, norm='ortho')
+#             bc_kp_hat = spfft.dctn(self.bc_kp, type=2, norm='ortho')
+
+#             # Allocate spectral space solution
+#             phi_hat = np.zeros((self.Nx, self.Ny, self.Nz), dtype=np.float64)
+
+#             # Set boundary values in spectral space
+#             phi_hat[:, :, 0] = bc_z0_hat
+#             phi_hat[:, :, self.k_mem_minus] = bc_km_hat
+#             phi_hat[:, :, self.k_mem_plus] = bc_kp_hat
+#             phi_hat[:, :, -1] = bc_z1_hat
+
+#             # Solve for each (kx, ky) mode
+#             for ikx in range(self.Nx):
+#                 for iky in range(self.Ny):
+#                     lambda_k = np.sqrt(self.lambda2[ikx, iky])
+
+#                     # Region 1: z ∈ [0, k_mem_minus]
+#                     _solve_region_analytical(
+#                         phi_hat, ikx, iky, lambda_k,
+#                         z_start=0, z_end=self.k_mem_minus, dz=self.dz,
+#                         phi_left=bc_z0_hat[ikx, iky],
+#                         phi_right=bc_km_hat[ikx, iky]
+#                     )
+
+#                     # Region 2: z ∈ [k_mem_minus, k_mem_plus] (membrane, just 2-3 points)
+#                     # Use linear interpolation for this thin region
+#                     n_mem = self.k_mem_plus - self.k_mem_minus
+#                     for iz in range(1, n_mem):
+#                         alpha = iz / n_mem
+#                         phi_hat[ikx, iky, self.k_mem_minus + iz] = \
+#                             (1 - alpha) * bc_km_hat[ikx, iky] + alpha * bc_kp_hat[ikx, iky]
+
+#                     # Region 3: z ∈ [k_mem_plus, Nz-1]
+#                     _solve_region_analytical(
+#                         phi_hat, ikx, iky, lambda_k,
+#                         z_start=self.k_mem_plus, z_end=self.Nz - 1, dz=self.dz,
+#                         phi_left=bc_kp_hat[ikx, iky],
+#                         phi_right=bc_z1_hat[ikx, iky]
+#                     )
+
+#             # Inverse 2D DCT for each Z-slice to get back to physical space
+#             for iz in range(self.Nz):
+#                 self.phi[:, :, iz] = spfft.idctn(phi_hat[:, :, iz], type=2, norm='ortho')
+
+#         # Broadcast solution to all ranks
+#         self.phi = self.comm.bcast(self.phi, root=0)
+
+#         return self
+
+#     def current_slice_kplus_minus(self, dz, sigma_e):
+#         """
+#         Compute ionic current density at membrane planes.
+#         Same interface as PETScPoissonGAMG.
+
+#         Returns J = σ_e * (∂φ/∂z)|_{k+} + (∂φ/∂z)|_{k-}
+#         """
+#         if self.rank == 0:
+#             k_plus = self.k_mem_plus
+#             k_minus = self.k_mem_minus
+
+#             # Finite difference gradients
+#             # grad_plus = (self.phi[:, :, k_plus + 1] - self.phi[:, :, k_plus]) / dz
+#             # grad_minus = (self.phi[:, :, k_minus] - self.phi[:, :, k_minus - 1]) / dz
+#             dphidz_plus  = (-3*self.phi[:,:,k_plus]  + 4*self.phi[:,:,k_plus+1]  - self.phi[:,:,k_plus+2]) /(2*dz)
+#             dphidz_minus = ( 3*self.phi[:,:,k_minus] - 4*self.phi[:,:,k_minus-1] + self.phi[:,:,k_minus-2])/(2*dz)
+#             J = sigma_e * (dphidz_plus + dphidz_minus)
+
+            
+#             return J
+#         else:
+#             return None
+        
+# @numba.njit(cache=True, fastmath=True)
+# def _solve_region_analytical(phi_hat, ikx, iky, lambda_k,
+#                                 z_start, z_end, dz, phi_left, phi_right):
+#     """
+#     Solve 1D Helmholtz eq: d^2 phi / dz^2 - lambda^2 phi = 0
+#     Using numerically stable formulation for large lambda.
+#     """
+#     # Create local coordinate system
+#     n_points = z_end - z_start + 1
+#     z_local = np.arange(n_points) * dz
+#     L_region = (n_points - 1) * dz
+    
+#     # Select the slice of the solution array we are writing to
+#     # (This avoids the slow Python loop 'for iz in range...')
+#     sol_slice = phi_hat[ikx, iky, z_start : z_end + 1]
+
+#     # Case 1: Zero frequency (Linear interpolation)
+#     if lambda_k < 1e-12:
+#         alpha = z_local / L_region
+#         sol_slice[:] = (1.0 - alpha) * phi_left + alpha * phi_right
+#         return
+
+#     # Case 2: High frequency (Numerically Stable Formulation)
+#     # Formula: phi(z) = phi_L * sinh(lam*(L-z))/sinh(lam*L) + phi_R * sinh(lam*z)/sinh(lam*L)
+    
+#     # Check for potential overflow in sinh (limit is ~709 for float64)
+#     # For a 10um box, lambda can get high, but usually < 700 with standard grids.
+#     # If lambda_k * L_region > 700, we should use exp formulation, 
+#     # but standard np.sinh handles up to ~10^300, so checking for 'inf' is usually enough.
+    
+#     arg_L = lambda_k * L_region
+    
+#     # If argument is too large, use asymptotic approximation to avoid Inf/NaN
+#     if arg_L > 700: 
+#         # approximate sinh(x) ~ exp(x)/2
+#         # ratio sinh(lam*(L-z)) / sinh(lam*L) ~ exp(-lam*z)
+#         term1 = phi_left * np.exp(-lambda_k * z_local)
+#         # ratio sinh(lam*z) / sinh(lam*L) ~ exp(-lam*(L-z))
+#         term2 = phi_right * np.exp(-lambda_k * (L_region - z_local))
+#         sol_slice[:] = term1 + term2
+#     else:
+#         denom = np.sinh(arg_L)
+#         term1 = phi_left * np.sinh(lambda_k * (L_region - z_local)) / denom
+#         term2 = phi_right * np.sinh(lambda_k * z_local) / denom
+#         sol_slice[:] = term1 + term2
+        
+
+        
+import numpy as np
+import scipy.fft as spfft
+from mpi4py import MPI
+import numba
+
 class SpectralPoissonSolver:
     """
-    Fast spectral 3D Poisson/Laplace solver using:
-    - DCT-II in X and Y directions (for Neumann BCs)
-    - Analytical solution in Z direction (for Dirichlet BCs)
-
-    This solver is ~10-50x faster than iterative GAMG for this geometry.
-    It provides a drop-in replacement for PETScPoissonGAMG.
-
-    Boundary Conditions:
-    - X, Y: Homogeneous Neumann (∂φ/∂n = 0)
-    - Z: Non-homogeneous Dirichlet at 4 planes:
-        * z=0: φ = -0.5*V_applied
-        * z=k_mem_minus: φ = -0.5*Vm[i,j]
-        * z=k_mem_plus: φ = +0.5*Vm[i,j]
-        * z=Nz-1: φ = +0.5*V_applied
-
-    The domain is split into 3 Z-regions, and each is solved analytically
-    in spectral space using sinh/cosh basis functions.
+    3D Electrostatic Solver using a singular-interface jump condition.
+    Enforces current continuity (Flux+) = (Flux-) and Potential Jump (Phi+ - Phi- = Vm).
     """
     def __init__(self, Nx, Ny, Nz, dx, dy, dz):
-        self.Nx, self.Ny = Nx, Ny
-        self.Nz = Nz if Nz % 2 else Nz + 1
+        self.Nx, self.Ny, self.Nz = Nx, Ny, Nz
         self.dx, self.dy, self.dz = dx, dy, dz
+        self.Lz = (Nz - 1) * dz
 
-        # Membrane plane indices
+        # Membrane location (Midplane)
         self.k_mem_minus = self.Nz // 2 - 1
-        self.k_mem_plus = self.Nz // 2 + 1
+        self.k_mem_plus  = self.Nz // 2 + 1
 
-        # Precompute wavenumbers for DCT-II (Neumann BCs)
-        # For Neumann BCs with DCT-II: k_n = π*n/L, n=0,1,2,...
-        kx = np.arange(Nx)
-        ky = np.arange(Ny)
-        Lx, Ly = Nx * dx, Ny * dy
+        # Precompute wavenumbers
+        kx = np.pi * np.arange(Nx) / (Nx * dx)
+        ky = np.pi * np.arange(Ny) / (Ny * dy)
+        self.lambda2 = kx[:, np.newaxis]**2 + ky[np.newaxis, :]**2
 
-        lambda_x = np.pi * kx / Lx
-        lambda_y = np.pi * ky / Ly
-
-        # Create 2D grid of eigenvalues
-        self.lambda2 = lambda_x[:, np.newaxis]**2 + lambda_y[np.newaxis, :]**2
-
-        # Storage for solution
         self.phi = np.zeros((Nx, Ny, Nz), dtype=np.float64)
-
-        # Boundary condition storage
-        self.bc_z0 = None
-        self.bc_z1 = None
-        self.bc_km = None
-        self.bc_kp = None
-
-        # For compatibility with PETSc interface
         self.comm = MPI.COMM_WORLD
         self.rank = self.comm.Get_rank()
 
-        # Warning: This is a serial solver (runs on rank 0 only)
-        if self.rank == 0:
-            print("INFO: Using SpectralPoissonSolver (serial, runs on rank 0 only)")
-
     def apply_dirichlet_planes(self, Vm, V_applied):
-        """Set boundary conditions (same interface as PETScPoissonGAMG)."""
+        """Prepares spectral boundary conditions."""
         if self.rank == 0:
-            self.bc_z0 = -0.5 * V_applied * np.ones((self.Nx, self.Ny))
-            self.bc_z1 = +0.5 * V_applied * np.ones((self.Nx, self.Ny))
-
-            if Vm is not None:
-                self.bc_km = -0.5 * Vm.copy()
-                self.bc_kp = +0.5 * Vm.copy()
-            else:
-                self.bc_km = np.zeros((self.Nx, self.Ny))
-                self.bc_kp = np.zeros((self.Nx, self.Ny))
-
-        # Broadcast to all ranks for consistency
-        self.bc_z0 = self.comm.bcast(self.bc_z0, root=0)
-        self.bc_z1 = self.comm.bcast(self.bc_z1, root=0)
-        self.bc_km = self.comm.bcast(self.bc_km, root=0)
-        self.bc_kp = self.comm.bcast(self.bc_kp, root=0)
+            # External Electrodes
+            self.bc_top = 0.5 * V_applied * np.ones((self.Nx, self.Ny))
+            self.bc_bot = -0.5 * V_applied * np.ones((self.Nx, self.Ny))
+            # Membrane Jump
+            self.Vm = Vm.copy() if Vm is not None else np.zeros((self.Nx, self.Ny))
 
     def solve(self):
-        """
-        Solve the 3D Laplace equation ∇²φ = 0 using spectral methods.
+        """Solves Laplace eq with interface jump and flux continuity using stable exp scaling."""
+        if self.rank != 0: return self
 
-        Strategy:
-        1. Apply 2D DCT in X-Y plane to boundary conditions
-        2. For each (kx, ky) mode, solve analytically in Z direction
-        3. Apply inverse 2D DCT to get physical space solution
+        top_hat = spfft.dctn(self.bc_top, type=2, norm='ortho')
+        bot_hat = spfft.dctn(self.bc_bot, type=2, norm='ortho')
+        Vm_hat  = spfft.dctn(self.Vm,     type=2, norm='ortho')
 
-        The Z-direction is divided into 3 regions:
-        - Region 1: [0, k_mem_minus]
-        - Region 2: [k_mem_minus, k_mem_plus] (membrane, linear interpolation)
-        - Region 3: [k_mem_plus, Nz-1]
+        phi_hat = np.zeros((self.Nx, self.Ny, self.Nz), dtype=np.float64)
+        L = self.Lz / 2.0 
 
-        Returns: self (for compatibility with PETSc interface)
-        """
-        if self.rank == 0:
-            # Transform boundary conditions to spectral space
-            bc_z0_hat = spfft.dctn(self.bc_z0, type=2, norm='ortho')
-            bc_z1_hat = spfft.dctn(self.bc_z1, type=2, norm='ortho')
-            bc_km_hat = spfft.dctn(self.bc_km, type=2, norm='ortho')
-            bc_kp_hat = spfft.dctn(self.bc_kp, type=2, norm='ortho')
+        for ikx in range(self.Nx):
+            for iky in range(self.Ny):
+                lam = np.sqrt(self.lambda2[ikx, iky])
+                
+                if lam < 1e-12: # DC Mode
+                    avg_ext = (top_hat[ikx,iky] + bot_hat[ikx,iky]) / 2.0
+                    phi_p_int =  0.5 * Vm_hat[ikx,iky] + avg_ext
+                    phi_m_int = -0.5 * Vm_hat[ikx,iky] + avg_ext
+                else:
+                    # STABLE LEAKAGE TERM:
+                    # 1/cosh(x) = 2*exp(-x) / (1 + exp(-2x))
+                    arg = lam * L
+                    if arg > 700:
+                        leakage_term = 0.0 # Electrode influence is zero at the membrane
+                    else:
+                        leakage_term = (top_hat[ikx,iky] + bot_hat[ikx,iky]) / (2.0 * np.cosh(arg))
+                    
+                    phi_p_int =  0.5 * Vm_hat[ikx,iky] + leakage_term
+                    phi_m_int = -0.5 * Vm_hat[ikx,iky] + leakage_term
 
-            # Allocate spectral space solution
-            phi_hat = np.zeros((self.Nx, self.Ny, self.Nz), dtype=np.float64)
+                # Populate Regions
+                _solve_region_analytical(phi_hat, ikx, iky, lam, 0, self.k_mem_minus, 
+                                          self.dz, bot_hat[ikx,iky], phi_m_int)
+                _solve_region_analytical(phi_hat, ikx, iky, lam, self.k_mem_plus, self.Nz-1, 
+                                          self.dz, phi_p_int, top_hat[ikx,iky])
+                
+                phi_hat[ikx, iky, self.Nz // 2] = (phi_p_int + phi_m_int) / 2.0
 
-            # Set boundary values in spectral space
-            phi_hat[:, :, 0] = bc_z0_hat
-            phi_hat[:, :, self.k_mem_minus] = bc_km_hat
-            phi_hat[:, :, self.k_mem_plus] = bc_kp_hat
-            phi_hat[:, :, -1] = bc_z1_hat
+        for iz in range(self.Nz):
+            self.phi[:, :, iz] = spfft.idctn(phi_hat[:, :, iz], type=2, norm='ortho')
 
-            # Solve for each (kx, ky) mode
-            for ikx in range(self.Nx):
-                for iky in range(self.Ny):
-                    lambda_k = np.sqrt(self.lambda2[ikx, iky])
-
-                    # Region 1: z ∈ [0, k_mem_minus]
-                    _solve_region_analytical(
-                        phi_hat, ikx, iky, lambda_k,
-                        z_start=0, z_end=self.k_mem_minus, dz=self.dz,
-                        phi_left=bc_z0_hat[ikx, iky],
-                        phi_right=bc_km_hat[ikx, iky]
-                    )
-
-                    # Region 2: z ∈ [k_mem_minus, k_mem_plus] (membrane, just 2-3 points)
-                    # Use linear interpolation for this thin region
-                    n_mem = self.k_mem_plus - self.k_mem_minus
-                    for iz in range(1, n_mem):
-                        alpha = iz / n_mem
-                        phi_hat[ikx, iky, self.k_mem_minus + iz] = \
-                            (1 - alpha) * bc_km_hat[ikx, iky] + alpha * bc_kp_hat[ikx, iky]
-
-                    # Region 3: z ∈ [k_mem_plus, Nz-1]
-                    _solve_region_analytical(
-                        phi_hat, ikx, iky, lambda_k,
-                        z_start=self.k_mem_plus, z_end=self.Nz - 1, dz=self.dz,
-                        phi_left=bc_kp_hat[ikx, iky],
-                        phi_right=bc_z1_hat[ikx, iky]
-                    )
-
-            # Inverse 2D DCT for each Z-slice to get back to physical space
-            for iz in range(self.Nz):
-                self.phi[:, :, iz] = spfft.idctn(phi_hat[:, :, iz], type=2, norm='ortho')
-
-        # Broadcast solution to all ranks
         self.phi = self.comm.bcast(self.phi, root=0)
-
         return self
 
     def current_slice_kplus_minus(self, dz, sigma_e):
-        """
-        Compute ionic current density at membrane planes.
-        Same interface as PETScPoissonGAMG.
-
-        Returns J = σ_e * (∂φ/∂z)|_{k+} + (∂φ/∂z)|_{k-}
-        """
-        if self.rank == 0:
-            k_plus = self.k_mem_plus
-            k_minus = self.k_mem_minus
-
-            # Finite difference gradients
-            grad_plus = (self.phi[:, :, k_plus + 1] - self.phi[:, :, k_plus]) / dz
-            grad_minus = (self.phi[:, :, k_minus] - self.phi[:, :, k_minus - 1]) / dz
-            dphidz_plus  = (-3*self.phi[:,:,k_plus]  + 4*self.phi[:,:,k_plus+1]  - self.phi[:,:,k_plus+2]) /(2*dz)
-            dphidz_minus = ( 3*self.phi[:,:,k_minus] - 4*self.phi[:,:,k_minus-1] + self.phi[:,:,k_minus-2])/(2*dz)
-            J = sigma_e * (dphidz_plus + dphidz_minus)
-
-            
-            return J
-        else:
-            return None
+        """Calculates spectral current density J using stable asymptotic forms."""
+        if self.rank != 0: return None
         
+        top_hat = spfft.dctn(self.bc_top, type=2, norm='ortho')
+        bot_hat = spfft.dctn(self.bc_bot, type=2, norm='ortho')
+        Vm_hat  = spfft.dctn(self.Vm,     type=2, norm='ortho')
+        
+        J_hat = np.zeros((self.Nx, self.Ny))
+        L = self.Lz / 2.0
+
+        for ikx in range(self.Nx):
+            for iky in range(self.Ny):
+                lam = np.sqrt(self.lambda2[ikx, iky])
+                
+                if lam < 1e-12:
+                    J_hat[ikx,iky] = sigma_e * (top_hat[ikx,iky] - bot_hat[ikx,iky] - Vm_hat[ikx,iky]) / self.Lz
+                else:
+                    arg = lam * L
+                    # Asymptotic Stability check
+                    if arg > 700:
+                        # 1/sinh(x) -> 0 and coth(x) -> 1
+                        term_ext = 0.0
+                        term_int = Vm_hat[ikx,iky] / 2.0
+                    else:
+                        term_ext = (top_hat[ikx,iky] - bot_hat[ikx,iky]) / (2.0 * np.sinh(arg))
+                        term_int = (Vm_hat[ikx,iky] / 2.0) * (1.0 / np.tanh(arg))
+                    
+                    J_hat[ikx,iky] = sigma_e * lam * (term_ext - term_int)
+
+        return spfft.idctn(J_hat, type=2, norm='ortho')
+
 @numba.njit(cache=True, fastmath=True)
-def _solve_region_analytical(phi_hat, ikx, iky, lambda_k,
-                                z_start, z_end, dz, phi_left, phi_right):
-    """
-    Solve 1D Helmholtz eq: d^2 phi / dz^2 - lambda^2 phi = 0
-    Using numerically stable formulation for large lambda.
-    """
-    # Create local coordinate system
+def _solve_region_analytical(phi_hat, ikx, iky, lambda_k, z_start, z_end, dz, phi_left, phi_right):
     n_points = z_end - z_start + 1
     z_local = np.arange(n_points) * dz
     L_region = (n_points - 1) * dz
-    
-    # Select the slice of the solution array we are writing to
-    # (This avoids the slow Python loop 'for iz in range...')
     sol_slice = phi_hat[ikx, iky, z_start : z_end + 1]
 
-    # Case 1: Zero frequency (Linear interpolation)
     if lambda_k < 1e-12:
         alpha = z_local / L_region
         sol_slice[:] = (1.0 - alpha) * phi_left + alpha * phi_right
         return
 
-    # Case 2: High frequency (Numerically Stable Formulation)
-    # Formula: phi(z) = phi_L * sinh(lam*(L-z))/sinh(lam*L) + phi_R * sinh(lam*z)/sinh(lam*L)
-    
-    # Check for potential overflow in sinh (limit is ~709 for float64)
-    # For a 10um box, lambda can get high, but usually < 700 with standard grids.
-    # If lambda_k * L_region > 700, we should use exp formulation, 
-    # but standard np.sinh handles up to ~10^300, so checking for 'inf' is usually enough.
-    
     arg_L = lambda_k * L_region
-    
-    # If argument is too large, use asymptotic approximation to avoid Inf/NaN
     if arg_L > 700: 
-        # approximate sinh(x) ~ exp(x)/2
-        # ratio sinh(lam*(L-z)) / sinh(lam*L) ~ exp(-lam*z)
         term1 = phi_left * np.exp(-lambda_k * z_local)
-        # ratio sinh(lam*z) / sinh(lam*L) ~ exp(-lam*(L-z))
         term2 = phi_right * np.exp(-lambda_k * (L_region - z_local))
         sol_slice[:] = term1 + term2
     else:

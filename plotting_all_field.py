@@ -97,9 +97,9 @@ def process_simulation_data(results_dir="simulation_results"):
 def plot_pore_growth(times, radii, filename="pore_radius_vs_time.pdf"):
     print(f"   -> Generating {filename}...")
     fig, ax = plt.subplots(figsize=(3.25, 2.4))
-    ax.plot(times*1e9, radii*1e9, marker=".", linestyle="-", color="#d95f02", markersize=3)
-    ax.set_xlabel(r"Time $t$ (ns)")
-    ax.set_ylabel(r"Pore Radius $R_{pore}$ (nm)")
+    ax.plot(times*1e6, radii*1e9, marker=".", linestyle="-", color="#d95f02", markersize=3)
+    ax.set_xlabel(r"Time $t$ ($\mu$s)")
+    ax.set_ylabel(r"Effective Pore Radius $R_{pore}$ (nm)")
     ax.set_xlim(left=0)
     ax.set_ylim(bottom=0)
     ax.grid(False)
@@ -110,8 +110,8 @@ def plot_pore_growth(times, radii, filename="pore_radius_vs_time.pdf"):
 def plot_vm_history(times, vms, filename="vm_vs_time.pdf"):
     print(f"   -> Generating {filename}...")
     fig, ax = plt.subplots(figsize=(3.25, 2.4))
-    ax.plot(times*1e9, vms, marker=".", linestyle="-", color="#1b9e77", markersize=3)
-    ax.set_xlabel(r"Time $t$ (ns)")
+    ax.plot(times*1e6, vms, marker=".", linestyle="-", color="#1b9e77", markersize=3)
+    ax.set_xlabel(r"Time $t$ ($\mu$s)")
     ax.set_ylabel(r"Average $V_m$ (V)")
     ax.set_xlim(left=0)
     ax.grid(False)
@@ -121,8 +121,8 @@ def plot_vm_history(times, vms, filename="vm_vs_time.pdf"):
 
 def plot_final_phase_map(final_state, filename="final_phase_contour.pdf"):
     print(f"   -> Generating {filename}...")
-    x_nm = final_state['x'] * 1e9
-    y_nm = final_state['y'] * 1e9
+    x_nm = final_state['x'] * 1e6
+    y_nm = final_state['y'] * 1e6
     psi = final_state['psi']
     
     fig_width = 3.25
@@ -133,9 +133,9 @@ def plot_final_phase_map(final_state, filename="final_phase_contour.pdf"):
                    cmap="pink_r", vmin=0.0, vmax=1.0)
     ax.contour(x_nm, y_nm, psi.T, levels=[0.5], colors='gray', linewidths=0.5, linestyles='--')
 
-    ax.set_xlabel(r"$x$ (nm)")
-    ax.set_ylabel(r"$y$ (nm)")
-    ax.set_title(rf"$t = {final_state['time']*1e9:.1f}$ ns")
+    ax.set_xlabel(r"$x$ ($\mu$m)")
+    ax.set_ylabel(r"$z$ ($\mu$m)")
+    # ax.set_title(rf"$t = {final_state['time']*1e6:.1f}$ $\mu$s")
 
     divider = make_axes_locatable(ax)
     cax = divider.append_axes("right", size="5%", pad=0.1)
@@ -179,89 +179,232 @@ def plot_potential_slice(phi_slice, E_field, x_nm, z_nm, filename="potential_sli
     fig.savefig(filename, bbox_inches="tight")
     plt.close(fig)
 
-# --- 4. Main Execution ---
+
+# --- ADD THIS TO YOUR PLOTTING FUNCTIONS SECTION ---
+
+def plot_vm_contour(x, y, vm_field, time, filename="final_vm_distribution.pdf"):
+    """Plots the 2D distribution of the transmembrane potential Vm."""
+    print(f"   -> Generating {filename}...")
+    x_um = x * 1e6
+    y_um = y * 1e6
+    
+    fig_width = 3.25
+    aspect_ratio = vm_field.shape[0] / vm_field.shape[1]
+    fig, ax = plt.subplots(figsize=(fig_width, fig_width * aspect_ratio))
+
+    # Use a diverging or sequential colormap to show potential variations
+    im = ax.imshow(vm_field.T, origin="lower", extent=[x_um[0], x_um[-1], y_um[0], y_um[-1]], 
+                   cmap="magma")
+    
+    ax.set_xlabel(r"$x$ ($\mu$m)")
+    ax.set_ylabel(r"$y$ ($\mu$m)")
+    # ax.set_title(rf"$V_m$ field at $t = {time*1e6:.1f}$ $\mu$s")
+
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="5%", pad=0.1)
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label(r"Potential Jump $V_m$ (V)")
+    
+    fig.tight_layout(pad=0.2)
+    fig.savefig(filename, bbox_inches="tight")
+    plt.close(fig)
+
+def plot_vm_and_phase_overlay(x, vm_field, psi_field, filename="vm_phase_overlay.pdf"):
+    """
+    Plots a 1D slice of both Vm and Phase Field at the center line (Y-mid).
+    This visualizes how the potential jump aligns with the pore boundary.
+    """
+    print(f"   -> Generating {filename}...")
+    
+    # Get the center slice along Y
+    mid_y = vm_field.shape[1] // 2
+    vm_line = vm_field[:, mid_y]
+    psi_line = psi_field[:, mid_y]
+    x_um = x * 1e6
+
+    fig, ax1 = plt.subplots(figsize=(3.5, 2.6))
+
+    # Plot Phase Field (Left Axis)
+    color_psi = '#1f77b4'  # blue
+    ax1.plot(x_um, psi_line, color=color_psi, label=r"Phase $\psi$", linewidth=1.5)
+    ax1.set_xlabel(r"Position $x$ ($\mu$m)")
+    ax1.set_ylabel(r"Phase Field $\psi$", color=color_psi)
+    ax1.tick_params(axis='y', labelcolor=color_psi)
+    ax1.set_ylim(-0.05, 1.05)
+
+    # Create twin axis for Vm (Right Axis)
+    ax2 = ax1.twinx()
+    color_vm = '#d62728'  # red
+    ax2.plot(x_um, vm_line, '--', color=color_vm, label=r"$V_m$", linewidth=1.2)
+    ax2.set_ylabel(r"Transmembrane Potential $V_m$ (V)", color=color_vm)
+    ax2.tick_params(axis='y', labelcolor=color_vm)
+
+    # Highlight the pore area where psi < 0.5
+    ax1.fill_between(x_um, 0, 1, where=(psi_line < 0.5), 
+                    color='gray', alpha=0.1, label="Pore Region")
+
+    # ax1.set_title("Pore Interface Verification")
+    
+    fig.tight_layout()
+    fig.savefig(filename, bbox_inches="tight")
+    plt.close(fig)
+    
+def plot_vertical_jump_and_flux(phi, psi, z, sigma_e, filename="vertical_jump_continuity.pdf"):
+    """
+    Plots the potential Phi and Current Density Jz along the Z-axis.
+    Overlaying these shows the potential jump vs flux continuity.
+    """
+    nx, ny, nz = phi.shape
+    mx, my = nx // 2, ny // 2
+    nz_mid = nz // 2
+    
+    # Extract center-line data
+    z_um = z * 1e6
+    phi_line = phi[mx, my, :]
+    dz = z[1] - z[0]
+    
+    # Calculate Jz using 2nd-order center difference (away from jump)
+    # and one-sided differences (at the jump)
+    jz_line = np.zeros_like(phi_line)
+    
+    # Bulk Jz = -sigma * dPhi/dz
+    # Note: Using the same logic as your current calculation
+    kp = nz_mid + 1
+    km = nz_mid - 1
+    
+    # Gradient calculation matching your solver's logic
+    grad_p = (-3*phi[mx,my,kp] + 4*phi[mx,my,kp+1] - phi[mx,my,kp+2]) / (2*dz)
+    grad_m = (3*phi[mx,my,km] - 4*phi[mx,my,km-1] + phi[mx,my,km-2]) / (2*dz)
+    
+    # Fill the Jz line for plotting
+    # Simple central difference for the bulk
+    jz_line[1:-1] = -sigma_e * (phi_line[2:] - phi_line[:-2]) / (2*dz)
+    # Overwrite near jump with your high-accuracy one-sided gradients
+    jz_line[kp] = -sigma_e * grad_p
+    jz_line[km] = -sigma_e * grad_m
+    # At the exact midplane, average the flux
+    jz_line[nz_mid] = (jz_line[kp] + jz_line[km]) / 2.0
+
+    fig, ax1 = plt.subplots(figsize=(3.5, 2.8))
+
+    # 1. Plot Potential (Phi) - Left Axis
+    color_phi = '#1f77b4' # Blue
+    # Plot top and bottom separately to show the jump
+    ax1.plot(z_um[:nz_mid], phi_line[:nz_mid], 'o-', markersize=2, color=color_phi, label=r"Potential $\Phi$")
+    ax1.plot(z_um[nz_mid+1:], phi_line[nz_mid+1:], 'o-', markersize=2, color=color_phi)
+    
+    ax1.set_xlabel(r"Vertical distance $z$ ($\mu$m)")
+    ax1.set_ylabel(r"Potential $\Phi$ (V)", color=color_phi)
+    ax1.tick_params(axis='y', labelcolor=color_phi)
+
+    # 2. Plot Current Density (Jz) - Right Axis
+    ax2 = ax1.twinx()
+    color_j = '#d62728' # Red
+    ax2.plot(z_um[1:-1], jz_line[1:-1] * 1e-3, '--', color=color_j, alpha=0.7, label=r"Flux $J_z$")
+    ax2.set_ylabel(r"Current Density $J_z$ (mA/m$^2$)", color=color_j)
+    ax2.tick_params(axis='y', labelcolor=color_j)
+
+    # Set y-axis limits to be within 20% up and down of the average Jz
+    avg_jz = np.mean(jz_line[1:-1] * 1e-3)
+    ax2.set_ylim(avg_jz * 0.8, avg_jz * 1.2)
+    
+    # Vertical line at membrane
+    ax1.axvline(0, color='black', linewidth=0.8, linestyle='--', alpha=0.5)
+    
+    # ax1.set_title("Interface Jump & Flux Continuity")
+    fig.tight_layout()
+    fig.savefig(filename, bbox_inches="tight")
+    plt.close(fig)
+
 if __name__ == "__main__":
     setup_matplotlib_for_latex()
-    
-    results_path = "simulation_results"
-    
+    results_path = "simulation_results_worked_3"
     history, final_state = process_simulation_data(results_path)
 
     if history is not None:
         times, radii, vms = history
         
-        # 1. Plots
+        # 1. Standard History Plots
         plot_pore_growth(times, radii, filename="pore_radius_vs_time.pdf")
         plot_vm_history(times, vms, filename="vm_vs_time.pdf")
         plot_final_phase_map(final_state, filename="final_phase_contour.pdf")
+        plot_vm_and_phase_overlay(final_state['x'], final_state['Vm'], final_state['psi'], filename="vm_phase_overlay.pdf")
+        plot_vertical_jump_and_flux(final_state['phi_elec'], final_state['psi'], final_state['z'], sigma_e=1.0, filename="vertical_jump_continuity.pdf")
+        
+        # 2. NEW: Plot the 2D Vm field
+        # We use the 'Vm' array stored in final_state
+        if 'Vm' in final_state and final_state['Vm'] is not None:
+            plot_vm_contour(
+                final_state['x'], 
+                final_state['y'], 
+                final_state['Vm'], 
+                final_state['time'], 
+                filename="final_vm_distribution.pdf"
+            )
 
-        # 2. Prepare Data for Potential Slice
-        # We need to slice the 3D data manually before calling your function
+        # 3. Potential and E-Field Slice (Existing Logic)
         phi = final_state['phi_elec']
-        x = final_state['x']
-        y = final_state['y']
-        z = final_state['z']
-        H = smooth_step(final_state['psi'])
+        x, y, z = final_state['x'], final_state['y'], final_state['z']
+        psi = final_state['psi']
+        H = smooth_step(psi)
 
         if phi is not None and not np.all(phi == 0):
-            # A) Take slice at middle Y
-
-
-            # B) Calculate Gradients (E-field)
-            dx = x[1] - x[0]
-            dy = y[1] - y[0]
-            dz = z[1] - z[0]
-            Ex, Ey, Ez = np.gradient(-phi, dx, dy, dz)
             ny_mid = phi.shape[1] // 2
+            nz_mid = phi.shape[2] // 2
+            dx, dz = x[1] - x[0], z[1] - z[0]
+            
+            # Extract 2D slice at middle Y
             phi_slice = phi[:, ny_mid, :]
-            E_field_slice = (Ex[:, ny_mid, :], Ez[:, ny_mid, :])
 
+            # Initialize Gradients
+            Ex_slice = np.zeros_like(phi_slice)
+            Ez_slice = np.zeros_like(phi_slice)
 
-            # C) Prepare Coordinates (X in nm, Z in microns)
-            # This matches the labels: x (nm) and z (µm)
-            x_plot = x * 1e6
-            z_plot = z * 1e6
+            # Horizontal Gradient (Ex) - Safe along X
+            Ex_slice, _ = np.gradient(-phi_slice, dx, dz)
 
-            # D) Call YOUR function
+            # Vertical Gradient (Ez) - Split by the membrane to avoid the jump
+            # Bottom Electrolyte
+            _, Ez_slice[:, :nz_mid] = np.gradient(-phi_slice[:, :nz_mid], dx, dz)
+            # Top Electrolyte
+            _, Ez_slice[:, nz_mid+1:] = np.gradient(-phi_slice[:, nz_mid+1:], dx, dz)
+            
+            # Mask the interface index to prevent streamplot interpolation errors
+            Ez_slice[:, nz_mid] = 0.0
+            Ex_slice[:, nz_mid] = 0.0
+
+            # Convert to microns for visualization
+            x_plot, z_plot = x * 1e6, z * 1e6
+
             plot_potential_slice(
                 phi_slice, 
-                E_field_slice, 
+                (Ex_slice, Ez_slice), 
                 x_plot, 
                 z_plot, 
                 filename="electric_field_cross_section.pdf"
             )
-        
-        print("\n✅ All plots generated successfully.")
-        
-        # --- 3. Compute Pore Current (Corrected Version) ---
-        print("Computing pore current...")
-        sigma_eff = 1.0  # S/m, replace with actual conductivity if available
-        
-        # A) Get grid spacings.
-        dx, dy, dz = x[1] - x[0], y[1] - y[0], z[1] - z[0]
-        
-        # B) Find the z-index of the membrane's central plane.
-        k_m_idx = np.argmin(np.abs(z))
-        
-        # C) Calculate the z-component of the electric field (E_z = -dΦ/dz)
-        delta_phi_z = phi[:, :, k_m_idx + 1] - phi[:, :, k_m_idx - 1]
-        E_z = -delta_phi_z / (2.0 * dz)
-        
-        # D) Calculate the current density J_z = σ * E_z
-        J_z = sigma_eff * E_z
-        
-        # E) Use the smooth phase field H for a weighted integral.
-        pore_weight = 1.0 - H
-        
-        # F) Apply the weight to get the current density contribution from the pore.
-        J_pore_weighted = J_z * pore_weight
-        
-        # G) Integrate over the entire xy-plane area to get the total current I_pore.
-        dA = dx * dy
-        I_pore = np.sum(J_pore_weighted) * dA
-        
-        # Convert to nanoamperes (nA) for a more readable output
-        I_pore_nA = I_pore * 1e9 
-        print(f"   -> Computed Pore Current (I_pore): {I_pore_nA:.4f} nA")
 
-        print("\n✅ All plots generated and calculations completed successfully.")
+        # 3. Stable Pore Current Calculation
+        print("\nComputing stable pore current...")
+        sigma_e = 1.0  # [S/m] - Adjust to your electrolyte conductivity
+        dy = y[1] - y[0]
+        
+        # Define indices adjacent to the jump at z=0
+        kp = nz_mid + 1
+        km = nz_mid - 1
+        
+        # Calculate gradients just inside the bulk electrolyte regions
+        # Using 2nd-order one-sided finite differences
+        grad_p = (-3*phi[:,:,kp] + 4*phi[:,:,kp+1] - phi[:,:,kp+2]) / (2*dz)
+        grad_m = (3*phi[:,:,km] - 4*phi[:,:,km-1] + phi[:,:,km-2]) / (2*dz)
+        
+        
+        
+        # Average the flux from both sides (Flux Continuity ensures they are similar)
+        J_z = sigma_e * (-(grad_p + grad_m) / 2.0)
+        
+        # Integrate J_z over the pore area (where H is close to 0)
+        pore_mask = 1.0 - H
+        I_pore = np.sum(J_z * pore_mask) * (dx * dy)
+        
+        print(f"   -> Calculated Pore Current: {I_pore*1e9:.4f} nA")
