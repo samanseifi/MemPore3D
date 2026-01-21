@@ -445,36 +445,24 @@ class SpectralPoissonSolver:
         return self
 
     def current_slice_kplus_minus(self, dz, sigma_e):
-        """Calculates spectral current density J using stable asymptotic forms."""
+        """
+        Compute J using second-order one-sided finite differences.
+        O(dz²) accuracy at the membrane interface.
+        """
         if self.rank != 0: return None
         
-        top_hat = spfft.dctn(self.bc_top, type=2, norm='ortho')
-        bot_hat = spfft.dctn(self.bc_bot, type=2, norm='ortho')
-        Vm_hat  = spfft.dctn(self.Vm,     type=2, norm='ortho')
+        k_plus = self.k_mem_plus
+        k_minus = self.k_mem_minus
         
-        J_hat = np.zeros((self.Nx, self.Ny))
-        L = self.Lz / 2.0
+        # Second-order one-sided differences (forward at k_plus, backward at k_minus)
+        # Forward:  f'(x) = (-3f(x) + 4f(x+h) - f(x+2h)) / (2h)
+        # Backward: f'(x) = (3f(x) - 4f(x-h) + f(x-2h)) / (2h)
+        
+        grad_plus = (-3*self.phi[:,:,k_plus] + 4*self.phi[:,:,k_plus+1] - self.phi[:,:,k_plus+2]) / (2*dz)
+        grad_minus = (3*self.phi[:,:,k_minus] - 4*self.phi[:,:,k_minus-1] + self.phi[:,:,k_minus-2]) / (2*dz)
+        
+        return 0.5 * sigma_e * (grad_plus + grad_minus)
 
-        for ikx in range(self.Nx):
-            for iky in range(self.Ny):
-                lam = np.sqrt(self.lambda2[ikx, iky])
-                
-                if lam < 1e-12:
-                    J_hat[ikx,iky] = sigma_e * (top_hat[ikx,iky] - bot_hat[ikx,iky] - Vm_hat[ikx,iky]) / self.Lz
-                else:
-                    arg = lam * L
-                    # Asymptotic Stability check
-                    if arg > 700:
-                        # 1/sinh(x) -> 0 and coth(x) -> 1
-                        term_ext = 0.0
-                        term_int = Vm_hat[ikx,iky] / 2.0
-                    else:
-                        term_ext = (top_hat[ikx,iky] - bot_hat[ikx,iky]) / (2.0 * np.sinh(arg))
-                        term_int = (Vm_hat[ikx,iky] / 2.0) * (1.0 / np.tanh(arg))
-                    
-                    J_hat[ikx,iky] = sigma_e * lam * (term_ext - term_int)
-
-        return spfft.idctn(J_hat, type=2, norm='ortho')
 
 @numba.njit(cache=True, fastmath=True)
 def _solve_region_analytical(phi_hat, ikx, iky, lambda_k, z_start, z_end, dz, phi_left, phi_right):
