@@ -12,8 +12,8 @@ dx = x[1] - x[0]
 
 # We need a reasonable dt and periodic rebuilding of the Vm solver.
 solver_params = SolverParams(
-    save_frames=80,
-    implicit_dt_multiplier=10.0,    # A reasonable value for stability and speed.
+    save_frames=160,
+    implicit_dt_multiplier=100.0,    # A reasonable value for stability and speed.
     rebuild_vm_solver_every=15,     # Rebuild as the pore shape changes.
     n_tau_total=500.0,              # Simulate for 8x the membrane charging time.
     poisson_solver='spectral'
@@ -29,7 +29,7 @@ pore_growth_params = PhaseFieldParams(
 )
 
 high_voltage = Electrostatics(V_applied=1.5)
-thermal_params = ThermalParams(T=310, add_noise=True)
+thermal_params = ThermalParams(T=310.1, add_noise=True)
 
 print("--- Starting Simulation: Voltage-Driven Pore Expansion ---")
 simulate_membrane_charging(
