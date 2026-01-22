@@ -10,7 +10,7 @@ from mempore3d.solvers.phase_field_solver import smooth_step
 # --- 1. Style Setup ---
 def setup_matplotlib_for_latex():
     plt.rcParams.update({
-        "text.usetex": False,
+        "text.usetex": True,
         "font.family": "serif",
         "font.serif": ["DejaVu Serif"],
         "mathtext.fontset": "cm",
@@ -318,7 +318,7 @@ def plot_vertical_jump_and_flux(phi, psi, z, sigma_e, filename="vertical_jump_co
 
 if __name__ == "__main__":
     setup_matplotlib_for_latex()
-    results_path = "simulation_results_worked_3"
+    results_path = "simulation_results"
     history, final_state = process_simulation_data(results_path)
 
     if history is not None:

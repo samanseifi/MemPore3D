@@ -96,7 +96,7 @@ def plot_pore_growth_comparison(times_list, radii_list, labels, filename="pore_r
     
     # Loop through each dataset
     for times, radii, label in zip(times_list, radii_list, labels):
-        ax.plot(times*1e6, radii*1e9, marker=".", linestyle="-", markersize=3, label=label)
+        ax.plot(times*1e6, radii*1e9, linestyle="-", markersize=3, label=label)
     
     ax.set_xlabel(r"Time $t$ ($\mu$s)")
     ax.set_ylabel(r"Effective Pore Radius $R_{pore}$ (nm)")
@@ -113,7 +113,7 @@ def plot_vm_history_comparison(times_list, vms_list, labels, filename="vm_vs_tim
     fig, ax = plt.subplots(figsize=(4.0, 3.0))
     
     for times, vms, label in zip(times_list, vms_list, labels):
-        ax.plot(times*1e6, vms, marker=".", linestyle="-", markersize=3, label=label)
+        ax.plot(times*1e6, vms, linestyle="-", markersize=3, label=label)
     
     ax.set_xlabel(r"Time $t$ ($\mu$s)")
     ax.set_ylabel(r"Average $V_m$ (V)")
@@ -129,11 +129,12 @@ if __name__ == "__main__":
     
     # Define your directories and the labels you want in the legend
     directories = [
-        "simulation_results_worked_2",
-        "simulation_results_worked_3",
-        "simulation_results_worked_5"
+        "simulation_results_128x128x129_worked_3_v_125",
+        "simulation_results_128x128x129_worked_2_v_150",
+        "simulation_results_128x128x129_v150_320points",
+        "simulation_results_128x128x129_v150_M5e6"
     ]
-    custom_legends = ["Control", "High Voltage", "Modified Buffer"]
+    custom_legends = ["V=1.25 v, M=1e7", "V=1.50 v, M=1e7", "V=1.5 v, M=1e7", "V=1.5 v, M=5e6"]
     
     # Containers for aggregated data
     all_times = []
