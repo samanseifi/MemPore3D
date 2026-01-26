@@ -1,15 +1,25 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from scipy.signal import savgol_filter
 import glob
 import os
 import re
 
 from mempore3d.solvers.phase_field_solver import smooth_step
 
+
+def smooth_data(data, window_length=11, polyorder=2):
+    """Apply Savitzky-Golay filter for smoothing."""
+    if len(data) < window_length:
+        window_length = len(data) if len(data) % 2 == 1 else len(data) - 1
+    if window_length < polyorder + 2:
+        return data
+    return savgol_filter(data, window_length, polyorder)
+
 def setup_matplotlib_for_latex():
     plt.rcParams.update({
-        "text.usetex": False,
+        "text.usetex": True,
         "font.family": "serif",
         "font.serif": ["DejaVu Serif"],
         "mathtext.fontset": "cm",
@@ -92,12 +102,22 @@ def process_simulation_data(results_dir="simulation_results"):
 
 def plot_pore_growth_comparison(times_list, radii_list, labels, filename="pore_radius_vs_time_comparison.pdf"):
     print(f"   -> Generating {filename}...")
-    fig, ax = plt.subplots(figsize=(4.0, 3.0)) # Slightly wider for legend
-    
-    # Loop through each dataset
-    for times, radii, label in zip(times_list, radii_list, labels):
-        ax.plot(times*1e6, radii*1e9, linestyle="-", markersize=3, label=label)
-    
+    fig, ax = plt.subplots(figsize=(3.25, 2.4))
+
+    # Professional color palette
+    colors = plt.cm.Dark2.colors
+
+    for i, (times, radii, label) in enumerate(zip(times_list, radii_list, labels)):
+        t_plot = times * 1e6
+        r_plot = radii * 1e9
+        r_smooth = smooth_data(r_plot)
+        color = colors[i % len(colors)]
+
+        # Plot raw data with markers only (unfilled, matching color)
+        ax.plot(t_plot, r_plot, linestyle='', marker='.', markersize=3, color=color)
+        # Plot smoothed curve
+        ax.plot(t_plot, r_smooth, linestyle="-", color=color, label=label)
+
     ax.set_xlabel(r"Time $t$ ($\mu$s)")
     ax.set_ylabel(r"Effective Pore Radius $R_{pore}$ (nm)")
     ax.set_xlim(left=0)
@@ -110,13 +130,23 @@ def plot_pore_growth_comparison(times_list, radii_list, labels, filename="pore_r
 
 def plot_vm_history_comparison(times_list, vms_list, labels, filename="vm_vs_time_comparison.pdf"):
     print(f"   -> Generating {filename}...")
-    fig, ax = plt.subplots(figsize=(4.0, 3.0))
-    
-    for times, vms, label in zip(times_list, vms_list, labels):
-        ax.plot(times*1e6, vms, linestyle="-", markersize=3, label=label)
-    
+    fig, ax = plt.subplots(figsize=(3.25, 2.4))
+
+    # Professional color palette
+    colors = plt.cm.Dark2.colors
+
+    for i, (times, vms, label) in enumerate(zip(times_list, vms_list, labels)):
+        t_plot = times * 1e6
+        vm_smooth = smooth_data(vms)
+        color = colors[i % len(colors)]
+
+        # Plot raw data with markers only (unfilled, matching color)
+        ax.plot(t_plot[::2], vms[::2], linestyle='', marker='.', markersize=3, color=color)
+        # Plot smoothed curve
+        ax.plot(t_plot, vm_smooth, linestyle="-", color=color, label=label)
+
     ax.set_xlabel(r"Time $t$ ($\mu$s)")
-    ax.set_ylabel(r"Average $V_m$ (V)")
+    ax.set_ylabel(r"Average $\overline{V}_m$ (V)")
     ax.set_xlim(left=0)
     ax.legend(fontsize='small', frameon=False)
     ax.grid(False)
@@ -128,13 +158,47 @@ if __name__ == "__main__":
     setup_matplotlib_for_latex()
     
     # Define your directories and the labels you want in the legend
-    directories = [
-        "simulation_results_128x128x129_worked_3_v_125",
-        "simulation_results_128x128x129_worked_2_v_150",
-        "simulation_results_128x128x129_v150_320points",
-        "simulation_results_128x128x129_v150_M5e6"
+    # directories = [
+    #     "case_4",
+    #     "case_9",
+    #     "case_6"
+    # ]
+    # custom_legends = [
+    #     r"$\sigma=0$",
+    #     r"$\sigma=5\times 10^{-5}~\mathrm{J}\mathrm{m}^{-2}$",
+    #     r"$\sigma=5\times 10^{-4}~\mathrm{J}{m}^{-2}$"    ]
+    
+    # directories = [        
+    #     "case_1",
+    #     "simulation_results_128x128x129_v150_M5e6",
+    #     "case_10"
+    # ]
+    # custom_legends = [
+    #     r"$M=5\times 10^{7}~\mathrm{m}^{-2}\mathrm{J}^{-1}\mathrm{s}^{-1}$",
+    #     r"$M=5\times 10^{6}~\mathrm{m}^{-2}\mathrm{J}^{-1}\mathrm{s}^{-1}$",        
+    #     r"$M=5\times 10^{5}~\mathrm{m}^{-2}\mathrm{J}^{-1}\mathrm{s}^{-1}$" 
+    # ]
+    
+    # directories = [        
+    #     "case_2",
+    #     "case_4",
+    #     "case_5"
+    # ]
+    # custom_legends = [
+    #     r"$V_\mathrm{applied}=1.5~\mathrm{V}$",
+    #     r"$V_\mathrm{applied}=1.25~\mathrm{V}$",        
+    #     r"$V_\mathrm{applied}=1.0~\mathrm{V}$" 
+    # ]
+    
+    directories = [        
+        "case_11",
+        "case_12"
     ]
-    custom_legends = ["V=1.25 v, M=1e7", "V=1.50 v, M=1e7", "V=1.5 v, M=1e7", "V=1.5 v, M=5e6"]
+    custom_legends = [
+        r"$V_\mathrm{applied}=1.5~\mathrm{V}$",
+        r"$V_\mathrm{applied}=1.25~\mathrm{V}$" 
+    ]
+    
     
     # Containers for aggregated data
     all_times = []
