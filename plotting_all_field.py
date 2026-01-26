@@ -44,16 +44,34 @@ def calculate_pore_stats(psi, x, y):
         return np.sqrt(pore_area / np.pi)
     return 0.0
 
-def process_simulation_data(results_dir="simulation_results"):
+def process_simulation_data(results_dir="simulation_results", target_time=None):
+    """
+    Process simulation data from a results directory.
+
+    Parameters
+    ----------
+    results_dir : str
+        Directory containing step_*.npz files
+    target_time : float, optional
+        Target time in seconds to load state. If None, loads final state.
+        The closest available time point will be selected.
+
+    Returns
+    -------
+    history : tuple
+        (times, radii, avg_vms) arrays
+    state : dict
+        State dictionary at the selected time point
+    """
     file_pattern = os.path.join(results_dir, "step_*.npz")
     files = glob.glob(file_pattern)
     files.sort(key=natural_sort_key)
-    
+
     if not files:
-        print(f"❌ No files found in '{results_dir}'")
+        print(f"No files found in '{results_dir}'")
         return None, None
 
-    print(f"✅ Found {len(files)} files. Processing data...")
+    print(f"Found {len(files)} files. Processing data...")
 
     times = []
     radii = []
@@ -65,22 +83,33 @@ def process_simulation_data(results_dir="simulation_results"):
             psi = data['psi']
             x = data['x']
             y = data['y']
-            
+
             if 'avg_Vm' in data:
                 vm_val = data['avg_Vm']
             elif 'Vm' in data:
                 vm_val = np.mean(data['Vm'])
             else:
                 vm_val = 0.0
-            
+
             r = calculate_pore_stats(psi, x, y)
             times.append(t)
             radii.append(r)
             avg_vms.append(vm_val)
 
-    print(f"   -> Loading final 3D state from: {os.path.basename(files[-1])}")
-    with np.load(files[-1], allow_pickle=True) as data:
-        final_state = {
+    times_arr = np.array(times)
+
+    # Select file based on target_time
+    if target_time is not None:
+        # Find closest time point
+        idx = np.argmin(np.abs(times_arr - target_time))
+        selected_file = files[idx]
+        print(f"   -> Requested t={target_time*1e6:.2f} us, loading t={times_arr[idx]*1e6:.2f} us from: {os.path.basename(selected_file)}")
+    else:
+        selected_file = files[-1]
+        print(f"   -> Loading final state from: {os.path.basename(selected_file)}")
+
+    with np.load(selected_file, allow_pickle=True) as data:
+        state = {
             'x': data['x'],
             'y': data['y'],
             'z': data['z'],
@@ -89,8 +118,8 @@ def process_simulation_data(results_dir="simulation_results"):
             'phi_elec': data['phi_elec'],
             'time': data['time']
         }
-            
-    return (np.array(times), np.array(radii), np.array(avg_vms)), final_state
+
+    return (times_arr, np.array(radii), np.array(avg_vms)), state
 
 # --- 3. Plotting Functions ---
 
@@ -119,23 +148,49 @@ def plot_vm_history(times, vms, filename="vm_vs_time.pdf"):
     fig.savefig(filename, bbox_inches="tight")
     plt.close(fig)
 
-def plot_final_phase_map(final_state, filename="final_phase_contour.pdf"):
+def plot_phase_map(state, filename="phase_contour.pdf", show_title=True, shift_x=0.2, shift_y=0.2):
+    """
+    Plot the phase field at a given state.
+
+    Parameters
+    ----------
+    state : dict
+        State dictionary containing 'x', 'y', 'psi', 'time'
+    filename : str
+        Output filename
+    show_title : bool
+        Whether to show time as title
+    shift_x : float
+        Shift in x direction as fraction of domain (0 to 1). Due to periodic BC.
+    shift_y : float
+        Shift in y direction as fraction of domain (0 to 1). Due to periodic BC.
+    """
     print(f"   -> Generating {filename}...")
-    x_nm = final_state['x'] * 1e6
-    y_nm = final_state['y'] * 1e6
-    psi = final_state['psi']
-    
+    x_um = state['x'] * 1e6
+    y_um = state['y'] * 1e6
+    psi = state['psi'].copy()
+    time = float(state['time'])
+
+    # Apply periodic shift if requested
+    if shift_x != 0.0:
+        shift_pts_x = int(shift_x * psi.shape[0])
+        psi = np.roll(psi, shift_pts_x, axis=0)
+    if shift_y != 0.0:
+        shift_pts_y = int(shift_y * psi.shape[1])
+        psi = np.roll(psi, shift_pts_y, axis=1)
+
     fig_width = 3.25
     aspect_ratio = psi.shape[0] / psi.shape[1]
     fig, ax = plt.subplots(figsize=(fig_width, fig_width * aspect_ratio))
 
-    im = ax.imshow(psi.T, origin="lower", extent=[x_nm[0], x_nm[-1], y_nm[0], y_nm[-1]], 
+    im = ax.imshow(psi.T, origin="lower", extent=[x_um[0], x_um[-1], y_um[0], y_um[-1]],
                    cmap="pink_r", vmin=0.0, vmax=1.0)
-    ax.contour(x_nm, y_nm, psi.T, levels=[0.5], colors='gray', linewidths=0.5, linestyles='--')
+    ax.contour(x_um, y_um, psi.T, levels=[0.5], colors='gray', linewidths=0.5, linestyles='--')
 
     ax.set_xlabel(r"$x$ ($\mu$m)")
-    ax.set_ylabel(r"$z$ ($\mu$m)")
-    # ax.set_title(rf"$t = {final_state['time']*1e6:.1f}$ $\mu$s")
+    ax.set_ylabel(r"$y$ ($\mu$m)")
+    if show_title:
+        ax.set_title(rf"$t = {time*1e6:.2f}\ \mu$s")
 
     divider = make_axes_locatable(ax)
     cax = divider.append_axes("right", size="5%", pad=0.1)
@@ -146,6 +201,12 @@ def plot_final_phase_map(final_state, filename="final_phase_contour.pdf"):
     fig.tight_layout(pad=0.2)
     fig.savefig(filename, bbox_inches="tight")
     plt.close(fig)
+
+
+# Keep backward compatibility
+def plot_final_phase_map(final_state, filename="final_phase_contour.pdf"):
+    """Deprecated: Use plot_phase_map instead."""
+    plot_phase_map(final_state, filename, show_title=True)
 
 # --- YOUR REQUESTED FUNCTION ---
 def plot_potential_slice(phi_slice, E_field, x_nm, z_nm, filename="potential_slice.pdf"):
@@ -182,53 +243,85 @@ def plot_potential_slice(phi_slice, E_field, x_nm, z_nm, filename="potential_sli
 
 # --- ADD THIS TO YOUR PLOTTING FUNCTIONS SECTION ---
 
-def plot_vm_contour(x, y, vm_field, time, filename="final_vm_distribution.pdf"):
-    """Plots the 2D distribution of the transmembrane potential Vm."""
+def plot_vm_contour(x, y, vm_field, time, filename="final_vm_distribution.pdf", show_title=True,
+                    shift_x=0.0, shift_y=0.0):
+    """
+    Plots the 2D distribution of the transmembrane potential Vm.
+
+    Parameters
+    ----------
+    shift_x : float
+        Shift in x direction as fraction of domain (0 to 1). Due to periodic BC.
+    shift_y : float
+        Shift in y direction as fraction of domain (0 to 1). Due to periodic BC.
+    """
     print(f"   -> Generating {filename}...")
     x_um = x * 1e6
     y_um = y * 1e6
-    
+    vm = vm_field.copy()
+
+    # Apply periodic shift if requested
+    if shift_x != 0.0:
+        shift_pts_x = int(shift_x * vm.shape[0])
+        vm = np.roll(vm, shift_pts_x, axis=0)
+    if shift_y != 0.0:
+        shift_pts_y = int(shift_y * vm.shape[1])
+        vm = np.roll(vm, shift_pts_y, axis=1)
+
     fig_width = 3.25
-    aspect_ratio = vm_field.shape[0] / vm_field.shape[1]
+    aspect_ratio = vm.shape[0] / vm.shape[1]
     fig, ax = plt.subplots(figsize=(fig_width, fig_width * aspect_ratio))
 
     # Use a diverging or sequential colormap to show potential variations
-    im = ax.imshow(vm_field.T, origin="lower", extent=[x_um[0], x_um[-1], y_um[0], y_um[-1]], 
+    im = ax.imshow(vm.T, origin="lower", extent=[x_um[0], x_um[-1], y_um[0], y_um[-1]],
                    cmap="magma")
-    
+
     ax.set_xlabel(r"$x$ ($\mu$m)")
     ax.set_ylabel(r"$y$ ($\mu$m)")
-    # ax.set_title(rf"$V_m$ field at $t = {time*1e6:.1f}$ $\mu$s")
+    if show_title:
+        ax.set_title(rf"$t = {float(time)*1e6:.2f}\ \mu$s")
 
     divider = make_axes_locatable(ax)
     cax = divider.append_axes("right", size="5%", pad=0.1)
     cbar = fig.colorbar(im, cax=cax)
     cbar.set_label(r"Potential Jump $V_m$ (V)")
-    
+
     fig.tight_layout(pad=0.2)
     fig.savefig(filename, bbox_inches="tight")
     plt.close(fig)
 
-def plot_vm_and_phase_overlay(x, vm_field, psi_field, filename="vm_phase_overlay.pdf"):
+def plot_vm_and_phase_overlay(x, vm_field, psi_field, filename="vm_phase_overlay.pdf", shift_x=0.0):
     """
     Plots a 1D slice of both Vm and Phase Field at the center line (Y-mid).
     This visualizes how the potential jump aligns with the pore boundary.
+
+    Parameters
+    ----------
+    shift_x : float
+        Shift in x direction as fraction of domain (0 to 1). Due to periodic BC.
     """
     print(f"   -> Generating {filename}...")
-    
+
     # Get the center slice along Y
     mid_y = vm_field.shape[1] // 2
-    vm_line = vm_field[:, mid_y]
-    psi_line = psi_field[:, mid_y]
+    vm_line = vm_field[:, mid_y].copy()
+    psi_line = psi_field[:, mid_y].copy()
+
+    # Apply periodic shift if requested
+    if shift_x != 0.0:
+        shift_pts = int(shift_x * len(vm_line))
+        vm_line = np.roll(vm_line, shift_pts)
+        psi_line = np.roll(psi_line, shift_pts)
+
     x_um = x * 1e6
 
     fig, ax1 = plt.subplots(figsize=(3.5, 2.6))
 
     # Plot Phase Field (Left Axis)
     color_psi = '#1f77b4'  # blue
-    ax1.plot(x_um, psi_line, color=color_psi, label=r"Phase $\psi$", linewidth=1.5)
+    ax1.plot(x_um, psi_line, color=color_psi, label=r"Phase $\phi$", linewidth=1.5)
     ax1.set_xlabel(r"Position $x$ ($\mu$m)")
-    ax1.set_ylabel(r"Phase Field $\psi$", color=color_psi)
+    ax1.set_ylabel(r"Phase Field $\phi$", color=color_psi)
     ax1.tick_params(axis='y', labelcolor=color_psi)
     ax1.set_ylim(-0.05, 1.05)
 
@@ -318,8 +411,8 @@ def plot_vertical_jump_and_flux(phi, psi, z, sigma_e, filename="vertical_jump_co
 
 if __name__ == "__main__":
     setup_matplotlib_for_latex()
-    results_path = "simulation_results"
-    history, final_state = process_simulation_data(results_path)
+    results_path = "case_12"
+    history, final_state = process_simulation_data(results_path, target_time=50e-6)
 
     if history is not None:
         times, radii, vms = history
