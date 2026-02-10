@@ -148,7 +148,7 @@ def plot_vm_history(times, vms, filename="vm_vs_time.pdf"):
     fig.savefig(filename, bbox_inches="tight")
     plt.close(fig)
 
-def plot_phase_map(state, filename="phase_contour.pdf", show_title=True, shift_x=0.2, shift_y=0.2):
+def plot_phase_map(state, filename="phase_contour.pdf", show_title=False, shift_x=0, shift_y=0):
     """
     Plot the phase field at a given state.
 
@@ -411,7 +411,7 @@ def plot_vertical_jump_and_flux(phi, psi, z, sigma_e, filename="vertical_jump_co
 
 if __name__ == "__main__":
     setup_matplotlib_for_latex()
-    results_path = "case_12"
+    results_path = "simulation_results"
     history, final_state = process_simulation_data(results_path, target_time=50e-6)
 
     if history is not None:

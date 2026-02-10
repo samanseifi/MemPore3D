@@ -17,13 +17,13 @@ solver_params = SolverParams(
     rebuild_vm_solver_every=15,     # Rebuild as the pore shape changes.
     n_tau_total=500.0,              # Simulate for 8x the membrane charging time.
     poisson_solver='spectral',
-    output_dir="case_7"
+    output_dir="case_9"
 )
 
 pore_growth_params = PhaseFieldParams(
     initial_state = 'intact',
     transition_thickness=1*dx,  
-    sigma_area=5e-3,
+    sigma_area=5e-5,
     mobility=2.5e7,
     line_tension=1.5e-11,
     evolve='on'

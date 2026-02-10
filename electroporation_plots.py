@@ -166,7 +166,7 @@ if __name__ == "__main__":
     # custom_legends = [
     #     r"$\sigma=0$",
     #     r"$\sigma=5\times 10^{-5}~\mathrm{J}\mathrm{m}^{-2}$",
-    #     r"$\sigma=5\times 10^{-4}~\mathrm{J}{m}^{-2}$"    ]
+    #     r"$\sigma=5\times 10^{-4}~\mathrm{J}\mathrm{m}^{-2}$"    ]
     
     # directories = [        
     #     "case_1",
@@ -174,9 +174,9 @@ if __name__ == "__main__":
     #     "case_10"
     # ]
     # custom_legends = [
-    #     r"$M=5\times 10^{7}~\mathrm{m}^{-2}\mathrm{J}^{-1}\mathrm{s}^{-1}$",
-    #     r"$M=5\times 10^{6}~\mathrm{m}^{-2}\mathrm{J}^{-1}\mathrm{s}^{-1}$",        
-    #     r"$M=5\times 10^{5}~\mathrm{m}^{-2}\mathrm{J}^{-1}\mathrm{s}^{-1}$" 
+    #     r"$M=5\times 10^{7}~\mathrm{m}^{2}\mathrm{J}^{-1}\mathrm{s}^{-1}$",
+    #     r"$M=5\times 10^{6}~\mathrm{m}^{2}\mathrm{J}^{-1}\mathrm{s}^{-1}$",        
+    #     r"$M=5\times 10^{5}~\mathrm{m}^{2}\mathrm{J}^{-1}\mathrm{s}^{-1}$" 
     # ]
     
     # directories = [        
@@ -191,12 +191,12 @@ if __name__ == "__main__":
     # ]
     
     directories = [        
-        "case_11",
-        "case_12"
+        "case_2",
+        "case_3"
     ]
     custom_legends = [
-        r"$V_\mathrm{applied}=1.5~\mathrm{V}$",
-        r"$V_\mathrm{applied}=1.25~\mathrm{V}$" 
+        r"$\gamma=1.5\times 10^{-11}~\mathrm{J}\mathrm{m}$",
+        r"$\gamma=5\times 10^{-12}~\mathrm{J}\mathrm{m}$"
     ]
     
     
