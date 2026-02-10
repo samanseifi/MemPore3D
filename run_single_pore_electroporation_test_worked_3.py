@@ -22,13 +22,13 @@ solver_params = SolverParams(
 pore_growth_params = PhaseFieldParams(
     initial_state = 'intact',
     transition_thickness=1*dx,  
-    sigma_area=5e-4,
+    sigma_area=0,
     mobility=5.0e7,
     line_tension=1.5e-11,
     evolve='on'
 )
 
-high_voltage = Electrostatics(V_applied=1.5)
+high_voltage = Electrostatics(V_applied=1.0)
 thermal_params = ThermalParams(T=310, add_noise=True)
 
 print("--- Starting Simulation: Voltage-Driven Pore Expansion ---")

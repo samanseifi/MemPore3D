@@ -60,3 +60,4 @@ class SolverParams:
     implicit_dt_multiplier: float = 100.0           # Factor to increase dt for implicit Vm solver
     rebuild_vm_solver_every: int = 20               # Rebuild the Vm implicit matrix every N steps
     poisson_solver: str = 'spectral'                # 'spectral' (fast) or 'gamg' (parallel)
+    output_dir: str = "simulation_results"          # Directory to save simulation results

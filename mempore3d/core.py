@@ -96,7 +96,7 @@ def simulate_membrane_charging(dom_in: Domain | None = None, props: MembraneProp
         solver.D_V = 0.0 
 
     # --- Setup Output Directory ---
-    output_dir = "simulation_results"
+    output_dir = solver.output_dir
     if rank == 0:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
