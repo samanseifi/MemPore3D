@@ -5,7 +5,7 @@ A 3D numerical simulation framework for electroporation in lipid membranes using
 Based on the method described in:
 > S. Seifi and D. Salac, "A Diffuse-Interface Method for Pore Dynamics in Lipid Membranes under Electric Fields," [arXiv:1611.03902](https://arxiv.org/abs/1611.03902)
 
-https://github.com/user-attachments/assets/evolution_analysis.mp4
+![Electroporation simulation showing Vm and pore radius evolution](evolution_analysis.gif)
 
 ## Overview
 
